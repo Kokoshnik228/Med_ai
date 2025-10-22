@@ -1,0 +1,75 @@
+# ── Python кэш/артефакты ───────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# ── Сборки и дистрибутивы ─────────────────────────────
+build/
+dist/
+*.egg-info/
+*.egg
+.wheels/
+*.spec
+MANIFEST
+
+# ── Виртуальные окружения ─────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+
+# ── Тесты/coverage ────────────────────────────────────
+.pytest_cache/
+.coverage*
+htmlcov/
+.tox/
+.nox/
+.cache/
+coverage.xml
+junit.xml
+
+# ── Типизация/линтеры ─────────────────────────────────
+.mypy_cache/
+.pytype/
+.pyre/
+
+# ── Jupyter ───────────────────────────────────────────
+.ipynb_checkpoints/
+
+# ── IDE/редакторы ─────────────────────────────────────
+.vscode/
+.idea/
+
+# ── Linux-мусор/временные файлы ───────────────────────
+*~
+.*.swp
+.*.swo
+.*.sw?
+.directory
+.nfs*
+
+# ── Секреты и локальные конфиги ───────────────────────
+.env
+.env.*
+*.env
+*.pem
+*.key
+*.p12
+secrets*.json
+*.sqlite3
+
+# ── Логи/времянка/выгрузки ────────────────────────────
+*.log
+tmp/
+temp/
+logs/
+outputs/
+data/
+downloads/
+index/
+raw_docs/
+cases/
+config/
+out/
+

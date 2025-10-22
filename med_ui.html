@@ -1,0 +1,136 @@
+<!doctype html>
+<html lang="ru">
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AI-ассистент врача — RAG (MVP)</title>
+<style>
+  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#f6f7fb;margin:0;color:#101828}
+  .wrap{max-width:1100px;margin:20px auto;padding:16px}
+  .card{background:#fff;border:1px solid #e5e7eb;border-radius:16px;box-shadow:0 1px 3px rgba(16,24,40,.08);padding:16px;margin-bottom:16px}
+  h1{font-size:20px;margin:0 0 8px}
+  label{font-weight:600;font-size:14px;margin:6px 0;display:block}
+  input,select,textarea{width:100%;border:1px solid #d0d5dd;border-radius:10px;padding:10px;font-size:14px}
+  textarea{min-height:180px}
+  .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  .btn{background:#2563eb;color:#fff;border:none;border-radius:10px;padding:10px 14px;font-weight:600;cursor:pointer}
+  .btn:disabled{opacity:.6;cursor:not-allowed}
+  .badge{display:inline-block;border:1px solid #d0d5dd;border-radius:999px;padding:2px 8px;font-size:12px;margin-left:8px}
+  .mono{font-family:ui-monospace,Menlo,Consolas,monospace;font-size:12px}
+  .small{font-size:12px;color:#475467}
+  .err{color:#b91c1c}
+  .grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  #apiBox{display:flex;gap:8px;align-items:center}
+  #apiManual{display:none}
+</style>
+<div class="wrap">
+  <div class="card">
+    <h1>AI-ассистент врача (MVP) <span id="score" class="badge">score: —</span></h1>
+    <div id="apiBox" class="small">API: <span id="api"></span>
+      <span id="apiManual">
+        <input id="apiInput" placeholder="http://HOST:PORT" style="width:260px">
+        <button id="apiSave" class="btn" style="padding:6px 10px">OK</button>
+      </span>
+      <span id="apiStatus" class="small" style="margin-left:8px"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <label>Текст кейса</label>
+    <textarea id="caseText" placeholder="Вставьте кейс: жалобы, анамнез, диагноз, назначения..."></textarea>
+    <div class="row">
+      <div>
+        <label>Запрос для поиска (необязательно)</label>
+        <input id="query" placeholder="например: гипертоническая болезнь лечение эналаприл">
+      </div>
+      <div>
+        <label>Модель / K</label>
+        <div class="row" style="grid-template-columns:2fr 1fr;gap:8px">
+          <select id="model"><option>llama3.1:8b</option><option>llama3.1:70b</option></select>
+          <input id="k" type="number" value="8" min="0" max="20">
+        </div>
+      </div>
+    </div>
+    <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
+      <button id="run" class="btn">Проанализировать</button>
+      <span id="busy" class="small" style="display:none">⏳ выполняется…</span>
+      <span id="error" class="small err"></span>
+    </div>
+  </div>
+
+  <div class="card">
+    <h3 style="margin:0 0 6px">Результат</h3>
+    <div class="grid2" id="subs"></div>
+    <div>
+      <h4>Критические ошибки</h4>
+      <ul id="crit"></ul>
+    </div>
+    <div>
+      <h4>Рекомендации</h4>
+      <ul id="recs"></ul>
+    </div>
+    <details><summary class="small">RAW JSON</summary>
+      <pre id="raw" class="mono"></pre>
+    </details>
+  </div>
+</div>
+<script>
+const el = id => document.getElementById(id);
+const show = (node, on) => node.style.display = on? '' : 'none';
+let API = null;
+
+async function pickApi(){
+  const host = location.hostname || 'localhost';
+  const candidates = [];
+  // 1) тот же origin (если API и UI на одном адресе)
+  if (location.origin.startsWith('http')) candidates.push(location.origin);
+  // 2) тот же хост, порт 7050 (наш дефолт API)
+  candidates.push(`${location.protocol}//${host}:7050`);
+  // 3) ещё популярные (на случай других конфигов)
+  candidates.push(`${location.protocol}//${host}:3001`);
+  candidates.push(`${location.protocol}//${host}:8080`);
+
+  for (const base of candidates){
+    try{
+      const r = await fetch(base + '/health', {method:'GET'});
+      if (r.ok){ API = base; el('api').textContent = base; el('apiStatus').textContent = 'OK'; return; }
+    }catch(e){ /* ignore */ }
+  }
+  // автопоиск не удался — включаем ручной ввод
+  el('api').textContent = 'не найден';
+  el('apiStatus').textContent = '';
+  show(el('apiManual'), true);
+}
+
+function colorForScore(s){ if(typeof s!=='number') return ''; if(s>=85) return '#dcfce7'; if(s>=65) return '#fef9c3'; return '#fee2e2'; }
+function renderResult(r){
+  const sc = r.score ?? '—'; const sb = el('score'); sb.textContent='score: '+sc; sb.style.background=colorForScore(sc);
+  const subs = el('subs'); subs.innerHTML=''; Object.entries(r.subscores||{}).forEach(([k,v])=>{ const d=document.createElement('div'); d.className='card'; d.style.margin=0; d.innerHTML=`<div class="small">${k}</div><div style="font-weight:700">${v??'—'}</div>`; subs.appendChild(d); });
+  const crit = el('crit'); crit.innerHTML=''; (r.critical_errors||[]).forEach(x=>{ const li=document.createElement('li'); li.textContent=`${x.type}: ${x.explain}`; crit.appendChild(li); });
+  const recs = el('recs'); recs.innerHTML=''; (r.recommendations||[]).forEach(x=>{ const li=document.createElement('li'); li.textContent=`${x.what_to_change} — ${x.rationale}`; recs.appendChild(li); });
+  el('raw').textContent = JSON.stringify(r,null,2);
+}
+
+async function run(){
+  el('error').textContent=''; show(el('busy'),true); el('run').disabled=true;
+  try{
+    if(!API) throw new Error('API не найден. Укажи вручную.');
+    const body = { case_text: el('caseText').value||'', query: el('query').value||null, k: parseInt(el('k').value||'8',10), model: el('model').value||'llama3.1:8b' };
+    const res = await fetch(API+'/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const txt = await res.text();
+    let data; try{ data = JSON.parse(txt); } catch(e){ throw new Error('Не удалось разобрать JSON ответа: '+txt.slice(0,200)); }
+    renderResult(data.result || data);
+  }catch(e){ el('error').textContent='Ошибка: '+(e?.message||e); }
+  finally{ show(el('busy'),false); el('run').disabled=false; }
+}
+
+// события
+el('run').onclick = run;
+el('apiSave').onclick = async () => {
+  const v = (el('apiInput').value||'').trim(); if(!v) return;
+  try{ const r = await fetch(v + '/health'); if(!r.ok) throw 0; API = v; el('api').textContent = v; el('apiStatus').textContent='OK'; show(el('apiManual'), false); }
+  catch{ el('apiStatus').textContent='не отвечает'; }
+};
+
+pickApi();
+</script>
+</html>

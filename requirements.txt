@@ -1,0 +1,14 @@
+# базовое
+ollama
+qdrant-client
+pyserini
+sentence-transformers
+rank-bm25
+rapidfuzz
+FlagEmbedding # для BGE reranker
+
+
+# langchain (на будущее)
+langchain
+langchain-community
+langchain-qdrant
