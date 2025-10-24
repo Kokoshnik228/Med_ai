@@ -6,6 +6,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import yaml, requests
+from pyserini.search.lucene import LuceneSearcher
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
@@ -23,6 +25,29 @@ LOCAL_YAML   = CONF_DIR / "local.yaml"
 
 def build_context_citations(ctx_items, max_out: int = 5):
     return [f"{it['doc_id']} стр.{it['page_start']}-{it['page_end']}" for it in ctx_items[:max_out]]
+def rrf_fusion(rank_lists: List[List[str]], k: int = 60) -> Dict[str, float]:
+    """Reciprocal Rank Fusion по спискам doc_id."""
+    scores: Dict[str, float] = {}
+    for ranks in rank_lists:
+        for r, did in enumerate(ranks, start=1):
+            scores[did] = scores.get(did, 0.0) + 1.0 / (k + r)
+    return scores
+
+def bm25_search(index_dir: str, query: str, topk: int) -> List[Dict[str, Any]]:
+    """Возвращает куски BM25: {doc_id, page, text}."""
+    searcher = LuceneSearcher(index_dir)
+    hits = searcher.search(query, k=topk)
+    out: List[Dict[str, Any]] = []
+    for h in hits:
+        doc = searcher.doc(h.docid)
+        contents = doc.contents() or ""
+        ext_id = doc.id()  # "{doc_id}_p{page}_c{child}"
+        m = re.match(r"(.+?)_p(\d+)_c(\d+)$", ext_id)
+        doc_id = m.group(1) if m else ext_id
+        page = int(m.group(2)) if m else 1
+        out.append({"doc_id": doc_id, "page": page, "text": contents})
+    return out
+
 
 
 def looks_meaningless(text: str) -> bool:
@@ -45,7 +70,7 @@ def load_config() -> Dict[str, Any]:
             return {}
     DEFAULTS = {
         "app": {"data_dir": "data", "bm25_index_dir": "index/bm25_idx"},
-        "qdrant": {"url": "http://localhost:7777", "collection": "med_kb"},
+        "qdrant": {"url": "http://localhost:7777", "collection": "med_kb_v3"},
         "ollama": {"base_url": "http://localhost:11434", "model": "llama3.1:8b"},
         "retrieval": {"k": 8},
         "embedding": {"model": "BAAI/bge-m3"},
@@ -112,9 +137,23 @@ def load_pages_text(pages_dir: Path, doc_id: str, p_start: int, p_end: int) -> s
         except Exception:
             continue
     return "\n".join(out)
+def embed_query_ollama(text: str) -> List[float]:
+    """Получить эмбеддинг запроса через Ollama и нормализовать."""
+    base = cfg("ollama","base_url", default="http://localhost:11434") or "http://localhost:11434"
+    url = base.rstrip("/") + "/api/embeddings"
+    payload = {
+        "model": cfg("embedding","model", default="zylonai/multilingual-e5-large"),
+        "prompt": text,
+    }
+    r = requests.post(url, json=payload, timeout=60)
+    r.raise_for_status()
+    vec = r.json().get("embedding", [])
+    return l2_unit(vec)
+
 
 def retrieve_light(query: str, k: int) -> List[Dict[str,Any]]:
     results: List[Dict[str,Any]] = []
+    
     if k <= 0: return results
     try:
         from qdrant_client import QdrantClient
@@ -123,7 +162,7 @@ def retrieve_light(query: str, k: int) -> List[Dict[str,Any]]:
         vec = model.encode([query], return_dense=True, return_sparse=False)["dense_vecs"][0]
         vec = l2_unit(vec)
         client = QdrantClient(url=cfg("qdrant","url", default="http://localhost:7777"))
-        pts = client.query_points(collection_name=cfg("qdrant","collection", default="med_kb"),
+        pts = client.query_points(collection_name=cfg("qdrant","collection", default="med_kb_v3"),
                                   query=vec, limit=max(k,20)).points
         pages_dir = Path(cfg("app","data_dir", default="data"))
         seen=set()
@@ -135,11 +174,99 @@ def retrieve_light(query: str, k: int) -> List[Dict[str,Any]]:
             a = int(pl.get("page_start",1) or 1)
             b = int(pl.get("page_end",a) or a)
             text = load_pages_text(pages_dir, did, a, b) or load_pages_text(pages_dir, did, 1, 1)
+            if not (pages_dir / f"{did}.pages.jsonl").exists():
+               continue
             results.append({"doc_id": did, "page_start": a, "page_end": b, "text": (text or "")[:2000]})
             if len(results)>=k: break
     except Exception:
         pass
     return results
+
+def retrieve_hybrid(query: str, k: int) -> List[Dict[str, Any]]:
+    """RRF слияние кандидатов Qdrant и BM25. Не более 2 кусочков на документ."""
+    results: List[Dict[str, Any]] = []
+    if k <= 0:
+        return results
+
+    # --- Qdrant кандидаты (уникальные doc_id и их первый payload) ---
+    qd_docids: List[str] = []
+    qd_payload_first: Dict[str, Dict[str, Any]] = {}
+    try:
+        from qdrant_client import QdrantClient
+        from FlagEmbedding import BGEM3FlagModel
+        model = BGEM3FlagModel(cfg("embedding","model", default="BAAI/bge-m3"), use_fp16=True)
+        vec = model.encode([query], return_dense=True, return_sparse=False)["dense_vecs"][0]
+        vec = l2_unit(vec)
+        client = QdrantClient(url=cfg("qdrant","url", default="http://localhost:7777"))
+        pts = client.query_points(
+            collection_name=cfg("qdrant","collection", default="med_kb_v3"),
+            query=vec, limit=max(k*6, 50)
+        ).points
+        for p in pts:
+            pl = p.payload or {}
+            did = pl.get("doc_id") or "unknown"
+            if did not in qd_payload_first:
+                qd_payload_first[did] = pl
+                qd_docids.append(did)
+    except Exception:
+        pass
+
+    # --- BM25 кандидаты (уникальные doc_id и их первый hit) ---
+    bm25_dir = cfg("app","bm25_index_dir", default="index/bm25_idx")
+    bm_docids: List[str] = []
+    bm_first: Dict[str, Dict[str, Any]] = {}
+    try:
+        bm_hits = bm25_search(bm25_dir, query, topk=max(k*6, 50))
+        for h in bm_hits:
+            did = h["doc_id"]
+            if did not in bm_first:
+                bm_first[did] = h
+                bm_docids.append(did)
+    except Exception:
+        pass
+
+    # --- RRF слияние списков doc_id ---
+    fused = rrf_fusion([qd_docids, bm_docids])
+    top_docids = [did for did,_ in sorted(fused.items(), key=lambda x: x[1], reverse=True)]
+
+    # --- Формируем выход (до k фрагментов, максимум 2 на doc_id) ---
+    pages_dir = Path(cfg("app","data_dir", default="data"))
+    per_doc_limit = 2
+    used_per_doc: Dict[str, int] = {}
+
+    for did in top_docids:
+        if len(results) >= k:
+            break
+
+        # 1) Сначала — BM25 фрагмент (точнее по терминам)
+        if did in bm_first and used_per_doc.get(did, 0) < per_doc_limit:
+            h = bm_first[did]
+            results.append({
+                "doc_id": did,
+                "page_start": h["page"],
+                "page_end": h["page"],
+                "text": (h["text"] or "")[:2000]
+            })
+            used_per_doc[did] = used_per_doc.get(did, 0) + 1
+            if len(results) >= k:
+                break
+
+        # 2) Затем — Qdrant фрагмент (по embedding-окну страниц)
+        if did in qd_payload_first and used_per_doc.get(did, 0) < per_doc_limit:
+            pl = qd_payload_first[did]
+            a = int(pl.get("page_start", 1) or 1)
+            b = int(pl.get("page_end", a) or a)
+            text = load_pages_text(pages_dir, did, a, b) or load_pages_text(pages_dir, did, 1, 1)
+            results.append({
+                "doc_id": did,
+                "page_start": a,
+                "page_end": b,
+                "text": (text or "")[:2000]
+            })
+            used_per_doc[did] = used_per_doc.get(did, 0) + 1
+
+    return results
+
 
 def safe_json_extract(s: str) -> Dict[str,Any]:
     try:
@@ -288,8 +415,12 @@ def config_reload():
 @app.post("/analyze")
 def analyze_ep(req: AnalyzeReq):
     try:
+        print("🚀 /analyze вызван")
+        print(f"📋 Текст кейса: {req.case_text[:150]}...")
+
         # --- 1️⃣ Проверка на бессмысленный текст ---
         if looks_meaningless(req.case_text):
+            print("⚠️ Текст бессмысленный — возврат без анализа")
             return {
                 "result": {
                     "score": 0,
@@ -303,16 +434,20 @@ def analyze_ep(req: AnalyzeReq):
 
         # --- 2️⃣ Получаем контекст из базы ---
         if req.query:
-          q = req.query
+            q = req.query
         else:
-         q = extract_medical_query(req.case_text)
+            q = extract_medical_query(req.case_text)
+        print(f"🔍 Извлечён поисковый запрос: {q}")
+
         if not q:
-           q = (req.case_text[:200] if req.case_text else "гипертензия лечение")
+            q = (req.case_text[:200] if req.case_text else "гипертензия лечение")
 
-        ctx_items = retrieve_light(q, req.k)
+        print("📡 Запрос контекста (retrieve_hybrid)...")
+        ctx_items = retrieve_hybrid(q, req.k)
+        print(f"✅ Контекст найден: {len(ctx_items)} фрагментов")
 
-        # если контекст не найден вообще
         if not ctx_items:
+            print("❌ Контекст не найден, выходим.")
             return {
                 "result": {
                     "score": 0,
@@ -331,17 +466,24 @@ def analyze_ep(req: AnalyzeReq):
                 for i, it in enumerate(ctx_items, 1)
             ]
         ) or "(контекст не найден)"
+        print("🧱 Контекст сформирован, длина:", len(ctx))
 
         system = cfg("prompt", "system", default="Анализируй кейс. Верни JSON.")
         user_t = cfg("prompt", "user_template", default="[КЕЙС]\n{case_text}\n\n[КОНТЕКСТ]\n{ctx}")
         user = user_t.format(case_text=req.case_text, ctx=ctx)
 
         # --- 4️⃣ Вызов модели ---
+        print("🧠 Отправляем запрос в Ollama...")
         resp = call_ollama_json(req.ollama_url, req.model, system, user)
+        print("🤖 Модель ответила:", str(resp)[:300])
+
         data = normalize_result(resp)
+        print("📊 Результат нормализован:", data.get("score"))
 
         # --- 5️⃣ Понижаем оценку, если контекст короткий ---
         ctx_len = sum(len(it.get("text", "")) for it in ctx_items)
+        print("📏 Длина контекста:", ctx_len)
+
         if ctx_len < 500:
             data["score"] = max(0, data.get("score", 0) * 0.5)
             data["disclaimer"] += " (Недостаточно контекста из базы знаний — достоверность снижена.)"
@@ -349,7 +491,7 @@ def analyze_ep(req: AnalyzeReq):
             data["score"] = max(0, data.get("score", 0) * 0.8)
             data["disclaimer"] += " (Контекст ограничен — достоверность частично снижена.)"
 
-        # --- 6️⃣ Подменяем источники на контекстные ---
+        # --- 6️⃣ Источники ---
         data["citations"] = build_context_citations(ctx_items, max_out=5)
         if not data.get("citations"):
             data["citations"] = [
@@ -357,16 +499,17 @@ def analyze_ep(req: AnalyzeReq):
                 for it in ctx_items[:5]
             ]
 
-        # --- 7️⃣ Дополнительно: наказываем за критические ошибки ---
+        # --- 7️⃣ Наказание за ошибки ---
         crit_count = len(data.get("critical_errors", []))
         if crit_count > 0:
             data["score"] = max(0, data["score"] - 10 * crit_count)
             data["disclaimer"] += f" (Обнаружено {crit_count} критических ошибок.)"
 
-        # --- 8️⃣ Возвращаем результат ---
+        print("✅ Готово. Итоговая оценка:", data["score"])
         return {"result": data, "citations_used": [x["doc_id"] for x in ctx_items]}
 
     except Exception as e:
+        print(f"❌ Ошибка в analyze_ep: {e}")
         return {
             "result": {
                 "score": None,
@@ -377,6 +520,7 @@ def analyze_ep(req: AnalyzeReq):
                 "disclaimer": f"Ошибка API: {e}",
             }
         }
+
 
 # ----- simple UI at "/" -----
 UI_HTML = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -515,29 +659,52 @@ import subprocess, threading, time
 index_status = {"state": "idle", "message": "Ожидание"}
 
 @app.post("/reindex")
-def reindex_ep():
-    """Перестраивает индекс: ingest + BM25 + Qdrant."""
+def reindex_ep(full: bool = False):
+    """Индексация: по умолчанию только новые; full=True — полная переиндексация."""
     def run_reindex():
         global index_status
         try:
-            index_status.update({"state": "running", "message": "Индексация запущена..."})
+            index_status.update({"state": "running", "message": "📘 Индексация запущена..."})
             print("⚙️ Запуск индексации документов...")
 
-            subprocess.run(["python", "ingest_from_raw.py", "--input-dir", "raw_docs", "--out-dir", "data"], check=True)
+            index_status["message"] = "📄 Шаг 1: парсинг PDF и создание JSON..."
+            subprocess.run([
+                "python", "ingest_from_raw.py",
+                "--input-dir", "raw_docs",
+                "--out-dir", "data"
+            ], check=True)
 
-            index_status["message"] = "Создание BM25 индекса..."
-            subprocess.run(["python", "build_bm25.py", "--pages-glob", "data/*.pages.jsonl", "--out-json", "index/bm25_json", "--index-dir", "index/bm25_idx"], check=True)
-            index_status["message"] = "Индексация в Qdrant..."
-            subprocess.run(["python", "chunk_and_index.py", "--pages-glob", "data/*.pages.jsonl", "--collection", "med_kb", "--qdrant-url", "http://localhost:7777"], check=True)
+            index_status["message"] = "📚 Шаг 2: построение BM25 индекса..."
+            subprocess.run([
+                "python", "build_bm25.py",
+                "--pages-glob", "data/*.pages.jsonl",
+                "--out-json", "index/bm25_json",
+                "--index-dir", "index/bm25_idx"
+            ], check=True)
+
+            index_status["message"] = "🧠 Шаг 3: индексация в Qdrant..."
+            cmd = [
+                "python", "chunk_and_index.py",
+                "--pages-glob", "data/*.pages.jsonl",
+                "--collection", "med_kb_v3",
+                "--qdrant-url", "http://localhost:7777",
+            ]
+            if full:
+                cmd.append("--recreate")
+            else:
+                cmd.append("--only-new")  # режим только новых чанков (по умолчанию и так включён)
+            subprocess.run(cmd, check=True)
 
             index_status.update({"state": "done", "message": "✅ Индексация завершена."})
             print("✅ Индексация завершена.")
         except Exception as e:
-            index_status.update({"state": "error", "message": f"Ошибка: {e}"})
+            index_status.update({"state": "error", "message": f"❌ Ошибка: {e}"})
             print(f"❌ Ошибка при индексации: {e}")
 
     threading.Thread(target=run_reindex, daemon=True).start()
     return {"status": "started", "message": ""}
+
+
 
 
 @app.get("/reindex/status")

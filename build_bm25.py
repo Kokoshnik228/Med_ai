@@ -2,9 +2,11 @@
 """
 Строит BM25-индекс (Pyserini/Lucene) из data/*.pages.jsonl.
 Режет страницы на child-чанки и индексирует их.
+
 Зависимости:
   pip install pyserini tqdm
   sudo apt install -y openjdk-17-jre-headless  # для Lucene
+
 Запуск:
   python build_bm25.py --pages-glob "data/*.pages.jsonl" \
     --out-json index/bm25_json --index-dir index/bm25_idx
@@ -15,8 +17,10 @@ from pathlib import Path
 from typing import Dict, Any, List
 from tqdm import tqdm
 
+
 def words(text: str) -> List[str]:
     return text.split()
+
 
 def chunk_words(tokens: List[str], max_len: int, overlap: int) -> List[List[str]]:
     chunks: List[List[str]] = []
@@ -28,6 +32,7 @@ def chunk_words(tokens: List[str], max_len: int, overlap: int) -> List[List[str]
             break
         i = max(0, j - overlap)
     return chunks
+
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build BM25 index from pages.jsonl")
@@ -46,16 +51,26 @@ def main() -> int:
     out_json_dir = Path(args.out_json)
     out_json_dir.mkdir(parents=True, exist_ok=True)
 
-    # JsonCollection: по файлу на документ; внутри — по строке JSON на каждый child-чанк
-    for fp in pages_files:
+    # ---- Основной цикл по документам ----
+    for fp in tqdm(pages_files, desc="Processing"):
         doc_id = fp.stem.replace(".pages", "")
         out_path = out_json_dir / f"{doc_id}.json"
-        with fp.open("r", encoding="utf-8") as f, out_path.open("w", encoding="utf-8") as fout:
-            pages: List[Dict[str, Any]] = []
+
+        # читаем страницы
+        pages: List[Dict[str, Any]] = []
+        with fp.open("r", encoding="utf-8") as f:
             for line in f:
                 rec = json.loads(line)
                 pages.append({"page": rec.get("page", 0), "text": rec.get("text", "")})
-            child_idx = 0
+
+        # если в документе вообще нет текста — пропускаем
+        if not any(p.get("text") for p in pages):
+            print(f"⚠️ Пропуск пустого документа: {fp.name}")
+            continue
+
+        # создаём файл только если есть чанки
+        child_idx = 0
+        with out_path.open("w", encoding="utf-8") as fout:
             for p in pages:
                 toks = words(p["text"]) if p["text"] else []
                 if not toks:
@@ -68,10 +83,17 @@ def main() -> int:
                     obj = {
                         "id": chunk_id,
                         "contents": text,
-                        "raw": json.dumps({"doc_id": doc_id, "page": p["page"], "child_idx": c_i}, ensure_ascii=False),
+                        "raw": json.dumps({
+                            "doc_id": doc_id,
+                            "page": p["page"],
+                            "child_idx": c_i
+                        }, ensure_ascii=False)
                     }
                     fout.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
+        print(f"✅ {doc_id} — записано {child_idx} чанков")
+
+    # ---- Запуск Lucene индексатора ----
     index_dir = Path(args.index_dir)
     index_dir.parent.mkdir(parents=True, exist_ok=True)
 
@@ -84,10 +106,13 @@ def main() -> int:
         "--threads", str(args.threads),
         "--storePositions", "--storeDocvectors", "--storeRaw",
     ]
+
     print("→ Запуск индексатора:", " ".join(cmd))
     subprocess.run(cmd, check=True)
-    print("Готово: BM25 индекс в", index_dir)
+    print("✅ Готово: BM25 индекс создан в", index_dir)
+
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

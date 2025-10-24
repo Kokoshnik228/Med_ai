@@ -134,20 +134,19 @@ def call_ollama(ollama_url: str, model: str, prompt: str) -> dict:
         "model": model,
         "prompt": prompt,
         "system": SYSTEM_PROMPT,
-        "format": "json",
-        "options": {
-            "temperature": 0.1,
-            "num_ctx": 8192,
-            "top_p": 0.9
-        },
+        "format": SCHEMA,  # <-- было "json"
+        "options": {"temperature": 0.1, "num_ctx": 8192, "top_p": 0.9},
         "stream": False
     }
-    r = requests.post(url, json=payload, timeout=120)
+    r = requests.post(url, json=payload, timeout=180)
     r.raise_for_status()
-    obj = r.json()
-    # Ollama возвращает {response, model, done, ...}
-    raw = obj.get("response", "").strip()
-    return json.loads(raw)
+    raw = (r.json() or {}).get("response", "").strip()
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        # безопасный фолбэк
+        return {"score": 0, "subscores": {}, "critical_errors": [], "recommendations": [], "citations": [], "disclaimer": "Ответ не прошёл строгий JSON."}
+
 
 
 def write_outputs(outdir: Path, case_name: str, result: dict):
