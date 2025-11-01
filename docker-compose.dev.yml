@@ -1,61 +1,55 @@
-
-
 services:
   qdrant:
     image: qdrant/qdrant:latest
     container_name: medai_qdrant_dev
     restart: unless-stopped
     ports:
-      - "7779:6333"               # внешний 7779 → внутр. 6333
+      - "7779:6333"                 # хост:7779 -> контейнер:6333
     volumes:
       - qdrant_storage_dev:/qdrant/storage
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   app:
     build: .
     container_name: medai_app_dev
     restart: unless-stopped
-
     depends_on:
       qdrant:
-        condition: service_started
+        condition: service_healthy
 
+    # читаем переменные из .env.dev (LLM_*, QDRANT_URL, EMBEDDING_MODEL и т.п.)
+    env_file:
+      - .env.dev
+
+    # локальные переопределения именно для контейнера (внутренний порт и пр.)
     environment:
-      # --- приложение ---
-      APP_ENV: "dev"
       APP_HOST: "0.0.0.0"
-      APP_PORT: "8000"
-
-      # --- Qdrant (внутри докер-сети) ---
-      QDRANT_URL: "http://qdrant:6333"
-      QDRANT_COLLECTION: "med_kb_v3"
-    
-
-      # --- эмбеддинги ---
-      EMB_BACKEND: "hf"
-      HF_MODEL: "BAAI/bge-m3"
-      HF_DEVICE: "cpu"
-      #NVIDIA_VISIBLE_DEVICES: "all"
-      #NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
-
-      # --- LLM на хосте (Ollama) ---
+      APP_PORT: "8000"              # ВНУТРИ контейнера слушаем 8000
       LLM_BASE_URL: "http://host.docker.internal:11434"
-      MODEL_ID: "llama3.1:8b"
 
     ports:
-      - "7050:8000"               # открываем API на 7050 с хоста
+      - "7050:8000"                 # с хоста ходим на 7050
 
     volumes:
       - ./:/app
 
     command: ["bash", "start.sh"]
 
-    # GPU для PyTorch/FlagEmbedding
-    #gpus: "all"
-    shm_size: "2g"
-
     # чтобы резолвился host.docker.internal на Linux
     extra_hosts:
       - "host.docker.internal:host-gateway"
+
+    # --- GPU (необязательно) ---
+    # раскомментируй, если настроен NVIDIA runtime
+    # gpus: "all"
+    # environment:
+    #   NVIDIA_VISIBLE_DEVICES: "all"
+    #   NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+    # shm_size: "2g"
 
 volumes:
   qdrant_storage_dev:

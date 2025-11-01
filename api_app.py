@@ -10,6 +10,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from glob import glob
+import importlib  # ← для горячей подгрузки runtime_settings.py
 
 # RAG utils
 from rag.bm25_utils import bm25_search, retrieve_hybrid, embed_query_hf
@@ -72,6 +73,21 @@ CONF_DIR = ROOT / "config"
 DEFAULT_YAML = CONF_DIR / "default.yaml"
 LOCAL_YAML = CONF_DIR / "local.yaml"
 
+def load_runtime_overrides() -> Dict[str, Any]:
+    """
+    Подхватывает config/runtime_settings.py (dict RUNTIME), можно менять без пересборки.
+    """
+    try:
+        import config.runtime_settings as rs  # type: ignore
+        importlib.reload(rs)
+        data = getattr(rs, "RUNTIME", None)
+        if isinstance(data, dict):
+            print("🔁 runtime_settings.py loaded")
+            return data
+    except Exception as e:
+        print(f"⚠️ runtime overrides not loaded: {e}")
+    return {}
+
 def load_config() -> Dict[str, Any]:
     def _load_yaml(p: Path) -> Dict[str, Any]:
         try:
@@ -88,7 +104,13 @@ def load_config() -> Dict[str, Any]:
         },
         "ollama": {
             "base_url": os.getenv("LLM_BASE_URL", "http://host.docker.internal:11434"),
-            "model": os.getenv("MODEL_ID", "llama3.1:8b"),
+            "model": os.getenv("MODEL_ID", os.getenv("LLM_MODEL", "llama3.1:8b")),
+            # ↓ параметры «как долго/много думает»
+            "max_tokens": int(os.getenv("LLM_MAX_TOKENS", "2048")),
+            "timeout_s": int(os.getenv("LLM_TIMEOUT", "180")),
+            "temperature": float(os.getenv("LLM_TEMPERATURE", "0.4")),
+            "top_p": float(os.getenv("LLM_TOP_P", "0.95")),
+            "num_ctx": int(os.getenv("LLM_NUM_CTX", "6144")),
         },
         "retrieval": {"k": 8},
         "embedding": {
@@ -125,6 +147,7 @@ def load_config() -> Dict[str, Any]:
 
     base = _load_yaml(DEFAULT_YAML)
     local = _load_yaml(LOCAL_YAML)
+    runtime = load_runtime_overrides()  # ← слой Python-настроек
 
     def merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
         out = dict(a)
@@ -135,7 +158,8 @@ def load_config() -> Dict[str, Any]:
                 out[k] = v
         return out
 
-    return merge(DEFAULTS, merge(base, local))
+    # Порядок важен: DEFAULTS <- default.yaml <- local.yaml <- runtime_settings.py
+    return merge(DEFAULTS, merge(base, merge(local, runtime)))
 
 CONFIG = load_config()
 
@@ -158,7 +182,6 @@ def warmup_bm25():
     except Exception as e:
         print(f"⚠️ BM25 warmup skipped: {e}")
 
-
 def cfg(*path: str, default: Any = None) -> Any:
     cur: Any = CONFIG
     for p in path:
@@ -176,6 +199,13 @@ def cfg_int(*path, default: int, allow_zero: bool = False) -> int:
         return v
     except Exception:
         return int(default)
+
+def cfg_float(*path, default: float) -> float:
+    v = cfg(*path, default=None)
+    try:
+        return float(v)
+    except Exception:
+        return float(default)
 
 def cfg_str(*path, default: str) -> str:
     v = cfg(*path, default=None)
@@ -227,7 +257,7 @@ def build_ctx_string(ctx_items, max_chars: int = 8000, per_text_limit: int = 800
     return "".join(parts)
 
 def _approx_tokens(s: str) -> int:
-    # очень грубо: 1 токен ≈ 4 символа для латиницы, для рус. чуть плотнее — но этого достаточно
+    # грубо: 1 токен ≈ 4 символа
     return max(1, len(s) // 4)
 
 # ================================
@@ -364,7 +394,6 @@ def normalize_result(r: Dict[str, Any]) -> Dict[str, Any]:
     out["disclaimer"] = str(disc) if disc is not None else ""
     return out
 
-
 def _ns_to_ms(ns: int) -> int:
     try:
         return int(round(float(ns) / 1_000_000.0))
@@ -399,13 +428,13 @@ def call_ollama_json(
     user_prompt: str,
     *,
     connect_timeout_s: float = 3.0,
-    read_timeout_s: float = 50.0,   # ← жёстко 50 сек по умолчанию
+    read_timeout_s: float = 50.0,
     num_ctx: int = 6144,
     num_predict: int = 160,
     temperature: float = 0.2,
     extra_options: Optional[Dict[str, Any]] = None,
-    options: Optional[Dict[str, Any]] = None,   # синоним
-    **_ignored_kwargs,                            # игнорируем неожиданные kwargs
+    options: Optional[Dict[str, Any]] = None,
+    **_ignored_kwargs,
 ) -> Dict[str, Any]:
     """Вызов Ollama /api/generate с поддержкой таймаутов, стрим-fallback и метрик."""
     import json as _json
@@ -417,10 +446,8 @@ def call_ollama_json(
             "num_ctx": int(num_ctx),
             "num_predict": int(num_predict),
             "temperature": float(temperature),
-            # никаких gpu_layers / num_gpu
         }
         if options:
-            # но на всякий случай вычистим устаревшее, если придёт сверху
             bad = {"gpu_layers", "num_gpu", "main_gpu"}
             opts.update({k:v for k,v in options.items() if k not in bad})
         if extra_options:
@@ -432,10 +459,9 @@ def call_ollama_json(
             "system": system_prompt,
             "format": "json",
             "options": opts,
-            "keep_alive": -1,     # <— пусть будет, дублировать не вредно
+            "keep_alive": -1,
             "stream": False,
-            }
-
+        }
 
         try:
             resp = _HTTP.post(
@@ -445,7 +471,7 @@ def call_ollama_json(
             )
             resp.raise_for_status()
         except requests.exceptions.ReadTimeout:
-            # ⬇️ стрим-fallback: начнём получать куски как только завершится префилл
+            # ⬇️ стрим-fallback
             try:
                 print("⏩ switch to streaming fallback")
                 raw_stream = _ollama_generate_stream(
@@ -463,7 +489,6 @@ def call_ollama_json(
         meta_logged = False
         if str(resp.headers.get("content-type", "")).startswith("application/json"):
             obj = resp.json()
-            # Попробуем вывести метрики
             if isinstance(obj, dict):
                 meta = {
                     "load_ms":   _ns_to_ms(obj.get("load_duration", 0)),
@@ -525,16 +550,40 @@ def health():
         "app_env": os.getenv("APP_ENV", "dev"),
         "qdrant": qdrant_url,
         "qdrant_collection": collection,
-        "llm_model": os.getenv("MODEL_ID", cfg("ollama", "model", default="llama3.1:8b")),
+        "llm_model": cfg("ollama", "model", default="llama3.1:8b"),
         "embed_backend": emb_backend,
         "embed_model": hf_model,
         "embed_device": device,
     }
 
+@app.get("/debug/config")
+def debug_config():
+    return {
+        "ollama": {
+            "base_url": cfg_str("ollama", "base_url", default="http://host.docker.internal:11434"),
+            "model": cfg_str("ollama", "model", default="llama3.1:8b"),
+            "max_tokens": cfg_int("ollama", "max_tokens", default=2048),
+            "timeout_s": cfg_int("ollama", "timeout_s", default=180),
+            "temperature": cfg_float("ollama", "temperature", default=0.4),
+            "top_p": cfg_float("ollama", "top_p", default=0.95),
+            "num_ctx": cfg_int("ollama", "num_ctx", default=6144),
+        },
+        "qdrant": {
+            "url": cfg_str("qdrant", "url", default="http://qdrant:6333"),
+            "collection": cfg_str("qdrant", "collection", default="med_kb_v3"),
+        },
+        "retrieval": {"k": cfg_int("retrieval", "k", default=8)},
+        "chunking": {
+            "child_w": cfg_int("chunking", "child_w", default=200),
+            "child_overlap": cfg_int("chunking", "child_overlap", default=35),
+            "parent_w": cfg_int("chunking", "parent_w", default=800),
+        },
+    }
+
 @app.post("/config/reload")
 def config_reload():
     global CONFIG
-    CONFIG = load_config()
+    CONFIG = load_config()  # ← подтянет обновлённый runtime_settings.py
     return {"status": "reloaded"}
 
 @app.post("/analyze")
@@ -588,21 +637,29 @@ def analyze_ep(req: AnalyzeReq):
         user_t = cfg("prompt", "user_template", default=DEFAULT_USER_TPL) or DEFAULT_USER_TPL
         user = user_t.format(case_text=req.case_text, ctx=ctx)
 
-        # динамический бюджет
+        # ── динамический бюджет контекста (но не выше num_ctx из конфига)
+        num_ctx_cap = cfg_int("ollama", "num_ctx", default=6144)
         total_est = _approx_tokens(system) + _approx_tokens(user)
-        num_ctx = min(6144, max(3072, total_est + 256))
-        num_predict = 160
+        num_ctx = min(num_ctx_cap, max(3072, total_est + 256))
 
-        print(f"🤖 LLM url={req.ollama_url or cfg('ollama','base_url', default='N/A')} model={req.model} num_ctx={num_ctx} num_predict={num_predict}")
+        # ── параметры «как долго и как много думаем»
+        llm_timeout   = cfg_int("ollama", "timeout_s", default=180)
+        llm_max_tok   = cfg_int("ollama", "max_tokens", default=2048)
+        llm_temp      = cfg_float("ollama", "temperature", default=0.4)
+        llm_top_p     = cfg_float("ollama", "top_p", default=0.95)
+
+        print(f"🤖 LLM url={req.ollama_url or cfg('ollama','base_url', default='N/A')} "
+              f"model={req.model} num_ctx={num_ctx} max_tokens={llm_max_tok} timeout={llm_timeout}s")
 
         # --- Вызов LLM (попытка 1) ---
         t_l0 = time.perf_counter()
         resp = call_ollama_json(
             req.ollama_url, req.model, system, user,
-            read_timeout_s=50.0,
+            read_timeout_s=float(llm_timeout),
             num_ctx=num_ctx,
-            num_predict=num_predict,
-            options={"repeat_penalty": 1.05}
+            num_predict=int(llm_max_tok),
+            temperature=float(llm_temp),
+            options={"top_p": float(llm_top_p), "repeat_penalty": 1.05},
         )
         data = normalize_result(resp)
         t_l1 = time.perf_counter()
@@ -622,14 +679,16 @@ def analyze_ep(req: AnalyzeReq):
             ctx_small = build_ctx_string(ctx_items[:min(3, len(ctx_items))], max_chars=6000, per_text_limit=700)
             user_small = user_t.format(case_text=req.case_text, ctx=ctx_small)
             total_est_small = _approx_tokens(system) + _approx_tokens(user_small)
-            num_ctx_small = min(5120, max(3072, total_est_small + 128))
+            num_ctx_small = min(num_ctx_cap, max(3072, total_est_small + 128))
+            retry_tokens = min(180, llm_max_tok)
 
             resp2 = call_ollama_json(
                 req.ollama_url, req.model, system, user_small,
-                read_timeout_s=45.0,
+                read_timeout_s=float(llm_timeout),
                 num_ctx=num_ctx_small,
-                num_predict=180,
-                options={"temperature": 0.15, "repeat_penalty": 1.05}
+                num_predict=int(retry_tokens),
+                temperature=max(0.0, float(llm_temp) * 0.9),
+                options={"top_p": float(llm_top_p), "repeat_penalty": 1.05},
             )
             data2 = normalize_result(resp2)
             if not _is_empty(data2):
