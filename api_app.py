@@ -612,7 +612,28 @@ def analyze_ep(req: AnalyzeReq):
 
         # --- Извлечение контекста ---
         t_r0 = time.perf_counter()
-        ctx_items = retrieve_hybrid(query, req.k)
+        ctx_items = retrieve_hybrid(
+            query, req.k,
+            bm25_index_dir = cfg("app", "bm25_index_dir", default="index/bm25_idx"),
+            qdrant_url     = cfg("qdrant", "url",        default="http://qdrant:6333"),
+            qdrant_collection = cfg("qdrant", "collection", default="med_kb_v3"),
+            pages_dir      = cfg("app", "data_dir",      default="data"),
+
+            # эмбеддинги
+            hf_model  = cfg("embedding", "model",  default=os.getenv("HF_MODEL", "BAAI/bge-m3")),
+            hf_device = cfg("embedding", "device", default=os.getenv("HF_DEVICE", "auto")),
+            hf_fp16   = bool(cfg("embedding", "fp16",   default=False)),
+
+            # сколько фрагментов из одного документа максимум
+            per_doc_limit = int(os.getenv("PER_DOC_LIMIT", cfg("app", "per_doc_limit", default=2))),
+
+            # РЕРАНКЕР — берём из runtime_settings
+            reranker_enabled = bool(cfg("reranker", "enabled", default=False)),
+            reranker_model   = cfg("reranker", "model",   default=os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")),
+            reranker_topn    = int(cfg("reranker", "top_n", default=50)),
+            reranker_device  = cfg("reranker", "device", default="cpu"),
+)
+
         t_r1 = time.perf_counter()
         if not ctx_items:
             return {"result": {

@@ -4,6 +4,7 @@ import re
 import json
 import socket
 import threading
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -204,6 +205,15 @@ def _rrf_fusion(rank_lists, k=60):
 # ============================================================
 # Гибридное извлечение: Qdrant (dense) + BM25 (sparse) + RRF
 # ============================================================
+
+@lru_cache(maxsize=2)
+def _get_reranker(model_name: str, device: str = "cpu"):
+    try:
+        from sentence_transformers import CrossEncoder
+    except Exception as e:
+        raise RuntimeError(f"sentence-transformers не установлен: {e}")
+    return CrossEncoder(model_name, device=device)
+
 def retrieve_hybrid(
     query: str,
     k: int,
@@ -216,16 +226,37 @@ def retrieve_hybrid(
     hf_device: Optional[str] = None,
     hf_fp16: bool = False,
     per_doc_limit: int = _PER_DOC_LIMIT,
+    # ↓↓↓ РЕРАНКЕР — управляется из runtime_settings / api_app
+    reranker_enabled: bool = False,
+    reranker_model: str = "BAAI/bge-reranker-v2-m3",
+    reranker_topn: int = 50,
+    reranker_device: str = "cpu",
 ) -> List[Dict[str, Any]]:
     """
-    RRF: объединяет кандидатов Qdrant (dense) и BM25 (sparse). Возвращает до k фрагментов.
-    КАЧЕСТВО НЕ МЕНЯЛ: только убран лишний I/O (кэш страниц и один раз открытый LuceneSearcher).
+    Гибрид без/с реранкером:
+      1) достаём кандидатов из Qdrant (dense) и BM25 (sparse)
+      2) смешиваем RRF по doc_id
+      3) собираем текстовые кандидаты (до reranker_topn)
+      4) если reranker_enabled — оцениваем CrossEncoder'ом (query, text) и берём топ-k
+         иначе — берём первые k по RRF.
     """
+
     results: List[Dict[str, Any]] = []
-    if k <= 0:
+    if k <= 0 or not query or not str(query).strip():
         return results
 
-    # ---------- 1) Qdrant (dense) ----------
+    # аккуратные лимиты кандидатов
+    def _limit(auto: int, env_name: str) -> int:
+        try:
+            v = int(os.getenv(env_name, "").strip() or 0)
+            return v if v > 0 else auto
+        except Exception:
+            return auto
+
+    dense_limit = _limit(min(max(k * 3, 24), 60), "RETRIEVE_KQ")
+    bm25_limit  = _limit(min(max(k * 3, 24), 60), "RETRIEVE_KB")
+
+    # ---------- 1) Qdrant ----------
     qd_docids: List[str] = []
     qd_payload_first: Dict[str, Dict[str, Any]] = {}
     try:
@@ -234,9 +265,9 @@ def retrieve_hybrid(
         pts = client.query_points(
             collection_name=qdrant_collection,
             query=vec,
-            limit=max(k*4, 40)
+            limit=dense_limit
         ).points
-        for p in pts:
+        for p in pts or []:
             pl = p.payload or {}
             did = pl.get("doc_id") or "unknown"
             if did not in qd_payload_first:
@@ -245,57 +276,75 @@ def retrieve_hybrid(
     except Exception as e:
         print("⚠️ Qdrant retrieve error:", e)
 
-    # ---------- 2) BM25 (sparse) ----------
+    # ---------- 2) BM25 ----------
     bm_docids: List[str] = []
     bm_first: Dict[str, Dict[str, Any]] = {}
     try:
-        hits = bm25_search(bm25_index_dir, query, topk=max(k*4, 40))
-        for h in hits:
-            did = h["doc_id"]
+        hits = bm25_search(bm25_index_dir, query, topk=bm25_limit)
+        for h in hits or []:
+            did = h.get("doc_id") or "unknown"
             if did not in bm_first:
                 bm_first[did] = h
                 bm_docids.append(did)
     except Exception as e:
         print("⚠️ BM25 retrieve error:", e)
 
-    # ---------- 3) RRF ----------
+    # ---------- 3) RRF по doc_id ----------
     fused = _rrf_fusion([qd_docids, bm_docids])
     top_docids = [did for did, _ in sorted(fused.items(), key=lambda x: x[1], reverse=True)]
 
-    # ---------- 4) Сбор контента (с кэшем страниц) ----------
+    # ---------- 4) Сбор кандидатов (до reranker_topn) ----------
     pages_dir_p = Path(pages_dir)
     used_per_doc: Dict[str, int] = {}
+    candidates: List[Dict[str, Any]] = []
+
+    # сколько кандидатов собирать «в запас»
+    cand_budget = reranker_topn if reranker_enabled else k
 
     for did in top_docids:
-        if len(results) >= k:
+        if len(candidates) >= cand_budget:
             break
 
-        # BM25-чанк (обычно уже содержит конкретный page)
+        # (a) BM25 сниппет
         if did in bm_first and used_per_doc.get(did, 0) < per_doc_limit:
             h = bm_first[did]
-            results.append({
-                "doc_id": did,
-                "page_start": h["page"],
-                "page_end": h["page"],
-                "text": (h["text"] or "")[:_TEXT_SNIPPET_LIMIT],
-            })
-            used_per_doc[did] = used_per_doc.get(did, 0) + 1
-            if len(results) >= k:
-                break
+            page = int(h.get("page", 1) or 1)
+            txt  = (h.get("text", "") or "")[:_TEXT_SNIPPET_LIMIT]
+            if txt:
+                candidates.append({
+                    "doc_id": did, "page_start": page, "page_end": page, "text": txt
+                })
+                used_per_doc[did] = used_per_doc.get(did, 0) + 1
+                if len(candidates) >= cand_budget:
+                    continue
 
-        # Qdrant «окно страниц»
+        # (b) Qdrant окно страниц
         if did in qd_payload_first and used_per_doc.get(did, 0) < per_doc_limit:
             pl = qd_payload_first[did]
             a = int(pl.get("page_start", 1) or 1)
             b = int(pl.get("page_end", a) or a)
             text = _load_pages_text(pages_dir_p, did, a, b) or _load_pages_text(pages_dir_p, did, 1, 1)
             if text:
-                results.append({
-                    "doc_id": did,
-                    "page_start": a,
-                    "page_end": b,
-                    "text": text[:_TEXT_SNIPPET_LIMIT],
+                candidates.append({
+                    "doc_id": did, "page_start": a, "page_end": b, "text": text[:_TEXT_SNIPPET_LIMIT]
                 })
                 used_per_doc[did] = used_per_doc.get(did, 0) + 1
 
-    return results
+    if not candidates:
+        return []
+
+    # ---------- 5) (опционально) Реранкер ----------
+    if reranker_enabled:
+        try:
+            model = _get_reranker(reranker_model, device=reranker_device)
+            pairs = [(query, c["text"]) for c in candidates]
+            # predict может возвращать numpy массив
+            scores = model.predict(pairs, convert_to_numpy=True, show_progress_bar=False)
+            for c, s in zip(candidates, scores):
+                c["_score"] = float(s)
+            candidates.sort(key=lambda x: x.get("_score", 0.0), reverse=True)
+        except Exception as e:
+            print(f"⚠️ Reranker disabled due to error: {e}")
+
+    # ---------- 6) Итог: top-k ----------
+    return candidates[:k]
