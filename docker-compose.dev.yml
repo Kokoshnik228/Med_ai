@@ -1,20 +1,13 @@
 services:
   qdrant:
-    image: qdrant/qdrant:1.15.5
+    image: qdrant/qdrant:v1.15.5
     container_name: medai_qdrant_dev
     restart: unless-stopped
     ports:
-      - "7779:6333"                 # хост:7779 -> контейнер:6333
+      - "7779:6333"
     volumes:
       - qdrant_storage_dev:/qdrant/storage
-    healthcheck:
-      # У Qdrant /readyz может возвращать "ok" или "all shards are ready".
-      # Делаем проверку устойчивой и без зависимости от наличия curl в образе.
-      test: ["CMD-SHELL", "wget -qO- http://localhost:6333/readyz 2>/dev/null | grep -Eqi 'ok|ready'"]
-      interval: 5s
-      timeout: 3s
-      retries: 30
-      start_period: 10s
+    # healthcheck удалён — некоторые сборки не содержат curl/wget
 
   app:
     build: .
@@ -22,26 +15,20 @@ services:
     restart: unless-stopped
     depends_on:
       qdrant:
-        condition: service_healthy   # при желании можно временно заменить на service_started
+        condition: service_started   # больше не ждём healthcheck
     env_file:
-      - .env.dev                     # LLM_*, QDRANT_URL=http://qdrant:6333 и т.п.
+      - .env.dev
     environment:
       APP_HOST: "0.0.0.0"
-      APP_PORT: "8000"               # внутри контейнера слушаем 8000
+      APP_PORT: "8000"
       LLM_BASE_URL: "http://host.docker.internal:11434"
     ports:
-      - "7050:8000"                  # с хоста ходим на 7050
+      - "7050:8000"
     volumes:
       - ./:/app
     command: ["bash", "start.sh"]
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    # --- GPU (по желанию) ---
-    # gpus: "all"
-    # environment:
-    #   NVIDIA_VISIBLE_DEVICES: "all"
-    #   NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
-    # shm_size: "2g"
 
 volumes:
   qdrant_storage_dev:

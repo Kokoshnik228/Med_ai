@@ -945,93 +945,129 @@ def reindex_ep(full: bool = False):
             return "http://localhost:7779"
         return url
 
-    def run_reindex():
-        global index_status
-        try:
-            index_status.update({"state": "running", "message": "📘 Индексация запущена..."})
-            print("⚙️ Запуск индексации документов...")
+def run_reindex():
+    global index_status
+    try:
+        index_status.update({"state": "running", "message": "📘 Индексация запущена..."})
+        print("⚙️ Запуск индексации документов...")
 
-            qdrant_url = _normalize_qdrant_url(_nz(_resolve("QDRANT_URL", "http://localhost:7779"), "http://localhost:7779"))
-            collection = _nz(_resolve("QDRANT_COLLECTION", "med_kb_v3"), "med_kb_v3")
-            emb_backend = _nz(os.getenv("EMB_BACKEND") or cfg("embedding", "backend", default="hf"), "hf")
-            hf_model    = _nz(os.getenv("HF_MODEL")    or cfg("embedding", "hf_model", default="BAAI/bge-m3"), "BAAI/bge-m3")
+        # --- окружение для подпроцессов ---
+        env = os.environ.copy()
+        env["QDRANT__PREFER_GRPC"] = "false"
 
-            child_w       = _as_int(os.getenv("CHILD_W"),       cfg("chunking", "child_w",       default=200))
-            child_overlap = _as_int(os.getenv("CHILD_OVERLAP"), cfg("chunking", "child_overlap", default=35))
-            parent_w      = _as_int(os.getenv("PARENT_W"),      cfg("chunking", "parent_w",      default=800))
+        # --- резолв параметров ---
+        qdrant_url = _normalize_qdrant_url(_nz(_resolve("QDRANT_URL", "http://localhost:7779"), "http://localhost:7779"))
+        collection = _nz(_resolve("QDRANT_COLLECTION", "med_kb_v3"), "med_kb_v3")
+        emb_backend = _nz(os.getenv("EMB_BACKEND") or cfg("embedding", "backend", default="hf"), "hf")
+        # поддержим оба ключа (hf_model|model) + ENV
+        hf_model = _nz(
+            os.getenv("HF_MODEL") or
+            cfg("embedding", "hf_model", default=cfg("embedding", "model", default="BAAI/bge-m3")),
+            "BAAI/bge-m3"
+        )
 
-            print(
-                "🔧 RESOLVED → "
-                f"QDRANT_URL={qdrant_url}  QDRANT_COLLECTION={collection}  "
-                f"EMB_BACKEND={emb_backend}  HF_MODEL={hf_model}  "
-                f"child_w={child_w} child_overlap={child_overlap} parent_w={parent_w}"
+        child_w       = _as_int(os.getenv("CHILD_W"),       cfg("chunking", "child_w",       default=200))
+        child_overlap = _as_int(os.getenv("CHILD_OVERLAP"), cfg("chunking", "child_overlap", default=35))
+        parent_w      = _as_int(os.getenv("PARENT_W"),      cfg("chunking", "parent_w",      default=800))
+
+        print(
+            "🔧 RESOLVED → "
+            f"QDRANT_URL={qdrant_url}  QDRANT_COLLECTION={collection}  "
+            f"EMB_BACKEND={emb_backend}  HF_MODEL={hf_model}  "
+            f"child_w={child_w} child_overlap={child_overlap} parent_w={parent_w}"
+        )
+
+        if not collection:
+            raise RuntimeError("QDRANT_COLLECTION пустой — укажи имя коллекции.")
+        if emb_backend not in ("hf", "ollama"):
+            raise RuntimeError(f"Неверный EMB_BACKEND: {emb_backend!r}")
+
+        # ---------------------------
+        # Шаг 1: INGEST (всегда)
+        # ---------------------------
+        index_status["message"] = "📄 Шаг 1: парсинг RAW → JSONL (инкрементальный)..."
+        print("▶️ ingest_from_raw.py ...")
+        cmd_ingest = [
+            "python", "ingest_from_raw.py",
+            "--input-dir", "raw_docs",
+            "--out-dir", "data",
+        ]
+        if full:
+            cmd_ingest.append("--force")   # полный прогон по запросу
+        _subprocess.run(cmd_ingest, check=True, env=env)
+
+        # ---------------------------
+        # Шаг 2: BM25 — только если появились новые pages.jsonl
+        # ---------------------------
+        from pathlib import Path
+        import time as _time
+
+        STAMP_BM25 = Path("index/.bm25_last_build")
+
+        def _latest_pages_mtime() -> float:
+            pages = list(Path("data").glob("*.pages.jsonl"))
+            return max((p.stat().st_mtime for p in pages), default=0.0)
+
+        def _bm25_needs_rebuild() -> bool:
+            last_pages = _latest_pages_mtime()
+            if last_pages == 0.0:
+                return False  # ещё нет страниц — нечего индексировать
+            if not STAMP_BM25.exists():
+                return True   # ещё ни разу не строили BM25
+            return last_pages > STAMP_BM25.stat().st_mtime
+
+        def _touch_bm25_stamp():
+            STAMP_BM25.parent.mkdir(parents=True, exist_ok=True)
+            STAMP_BM25.write_text(str(_time.time()), encoding="utf-8")
+
+        needs_bm25 = _bm25_needs_rebuild()
+        if not full and not needs_bm25:
+            index_status["message"] = "⏭️  Шаг 2 пропущен: новых страниц для BM25 нет"
+            print(index_status["message"])
+        else:
+            index_status["message"] = "📚 Шаг 2: построение/обновление BM25 индекса..."
+            print("▶️ build_bm25.py ...")
+            _subprocess.run(
+                [
+                    "python", "build_bm25.py",
+                    "--pages-glob", "data/*.pages.jsonl",
+                    "--out-json",   "index/bm25_json",
+                    "--index-dir",  "index/bm25_idx",
+                    # если добавишь инкрементальный режим в build_bm25.py, раскомментируй:
+                    # "--only-new",
+                ],
+                check=True, env=env
             )
+            _touch_bm25_stamp()
 
-            if not collection:
-                raise RuntimeError("QDRANT_COLLECTION пустой — укажи имя коллекции.")
-            if emb_backend not in ("hf", "ollama"):
-                raise RuntimeError(f"Неверный EMB_BACKEND: {emb_backend!r}")
+        # ---------------------------
+        # Шаг 3: Dense → Qdrant (инкрементально)
+        # ---------------------------
+        index_status["message"] = "🧠 Шаг 3: индексация в Qdrant (dense)..."
+        cmd = [
+            "python", "chunk_and_index.py",
+            "--pages-glob",    "data/*.pages.jsonl",
+            "--collection",    collection,
+            "--qdrant-url",    qdrant_url,
+            "--emb-backend",   emb_backend,
+            "--hf-model",      hf_model,
+            "--batch",         "512",
+            "--child-w",       str(child_w),
+            "--child-overlap", str(child_overlap),
+            "--parent-w",      str(parent_w),
+        ]
+        cmd.append("--recreate" if full else "--only-new")
+        cmd = [str(x) for x in cmd]
+        print("▶️ CMD:", " ".join(cmd))
+        _subprocess.run(cmd, check=True, env=env)
 
-            env = os.environ.copy()
-            env["QDRANT__PREFER_GRPC"] = "false"
+        index_status.update({"state": "done", "message": "✅ Индексация завершена."})
+        print("✅ Индексация завершена.")
 
-            # Шаг 1: ingest
-            pages_exist = bool(glob("data/*.pages.jsonl"))
-            if not full and pages_exist:
-                index_status["message"] = "⏭️  Шаг 1 пропущен: data/*.pages.jsonl уже существуют"
-                print(index_status["message"])
-            else:
-                index_status["message"] = "📄 Шаг 1: парсинг PDF → JSON..."
-                print("▶️ ingest_from_raw.py ...")
-                _subprocess.run(
-                    ["python", "ingest_from_raw.py", "--input-dir", "raw_docs", "--out-dir", "data"],
-                    check=True, env=env
-                )
+    except _subprocess.CalledProcessError as e:
+        index_status.update({"state": "error", "message": f"❌ Процесс упал: {e}"})
+        print(f"❌ Процесс упал: {e}")
+    except Exception as e:
+        index_status.update({"state": "error", "message": f"❌ Ошибка: {e}"})
+        print(f"❌ Ошибка при индексации: {e}")
 
-            # Шаг 2: BM25
-            if not full and _bm25_ready("index/bm25_idx"):
-                index_status["message"] = "⏭️  Шаг 2 пропущен: BM25 индекс уже готов"
-                print(index_status["message"])
-            else:
-                index_status["message"] = "📚 Шаг 2: построение BM25 индекса..."
-                print("▶️ build_bm25.py ...")
-                _subprocess.run(
-                    [
-                        "python", "build_bm25.py",
-                        "--pages-glob", "data/*.pages.jsonl",
-                        "--out-json",   "index/bm25_json",
-                        "--index-dir",  "index/bm25_idx",
-                    ],
-                    check=True, env=env
-                )
-
-            # Шаг 3: Dense → Qdrant
-            index_status["message"] = "🧠 Шаг 3: индексация в Qdrant (dense)..."
-            cmd = [
-                "python", "chunk_and_index.py",
-                "--pages-glob",    "data/*.pages.jsonl",
-                "--collection",    collection,
-                "--qdrant-url",    qdrant_url,
-                "--emb-backend",   emb_backend,
-                "--hf-model",      hf_model,
-                "--batch",         "512",
-                "--child-w",       str(child_w),
-                "--child-overlap", str(child_overlap),
-                "--parent-w",      str(parent_w),
-            ]
-            cmd.append("--recreate" if full else "--only-new")
-            cmd = [str(x) for x in cmd]
-            print("▶️ CMD:", " ".join(cmd))
-            _subprocess.run(cmd, check=True, env=env)
-
-            index_status.update({"state": "done", "message": "✅ Индексация завершена."})
-            print("✅ Индексация завершена.")
-        except subprocess.CalledProcessError as e:
-            index_status.update({"state": "error", "message": f"❌ Процесс упал: {e}"})
-            print(f"❌ Процесс упал: {e}")
-        except Exception as e:
-            index_status.update({"state": "error", "message": f"❌ Ошибка: {e}"})
-            print(f"❌ Ошибка при индексации: {e}")
-
-    threading.Thread(target=run_reindex, daemon=True).start()
-    return {"status": "started", "message": ""}

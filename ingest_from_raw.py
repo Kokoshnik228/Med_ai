@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """
 RAW (PDF/DOCX/TXT) -> data/*.pages.jsonl + data/manifest.json
-С приоритетом на качественный OCR для сканов.
 
 Особенности:
+- Поддержка PDF, DOCX, TXT (рекурсивно по --input-dir).
+- DOCX/TXT нарезаются на «псевдо-страницы» фиксированной длины (по умолчанию 1800 символов),
+  чтобы downstream (BM25/Qdrant/цитаты) был совместим с PDF-страницами.
 - OCR backends: tesseract (CPU) / easyocr (GPU при наличии CUDA).
 - Режимы OCR: auto (только если мало текста), always (всегда), never (выкл).
 - Предобработка изображений (OpenCV): CLAHE, бинаризация, шумоподавление.
 - Параллельная обработка файлов.
-- Чистка текста: дефисы на переносах, лишние пробелы, латиница→кириллица в частых ошибках.
 
-Требования (в контейнере app):
+Зависимости внутри контейнера app:
   pip install chardet pymupdf pillow python-docx
-  # для GPU-OCR:
+  # для GPU-OCR (необязательно):
   pip install easyocr opencv-python-headless
 """
 
@@ -20,6 +21,8 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import os
+import re
 import hashlib
 from pathlib import Path
 from typing import Dict, Any, List, Optional
@@ -34,16 +37,18 @@ except Exception as e:
     print("[ERR] Требуется PyMuPDF: pip install pymupdf", file=sys.stderr)
     raise
 
+# python-docx==1.1.2
 try:
-    import docx  # python-docx
+    from docx import Document
 except Exception:
-    docx = None
+    Document = None  # обработаем ниже
 
 try:
     import pytesseract
     from PIL import Image
     TESS_AVAILABLE = True
 except Exception:
+    from PIL import Image  # Pillow нам всё равно нужно
     TESS_AVAILABLE = False
 
 try:
@@ -95,21 +100,48 @@ def pixmap_to_pil(pix: "fitz.Pixmap") -> "Image.Image":
     return img
 
 
-# --- текстовая чистка для OCR ---
+# --- текстовая чистка для OCR/парсеров ---
 _LATIN_TO_CYR = str.maketrans({
-    "A":"А","a":"а","B":"В","E":"Е","e":"е","K":"К","k":"к","M":"М","H":"Н","O":"О","o":"о","P":"Р","p":"р","C":"С","c":"с","T":"Т","X":"Х","x":"х","Y":"У","y":"у"
+    "A":"А","a":"а","B":"В","E":"Е","e":"е","K":"К","k":"к","M":"М","H":"Н","O":"О","o":"о",
+    "P":"Р","p":"р","C":"С","c":"с","T":"Т","X":"Х","x":"х","Y":"У","y":"у"
 })
-def clean_ocr_text(text: str) -> str:
-    t = text.replace("\r", "")
-    # убрать переносы со знаком дефиса
-    t = t.replace("-\n", "")
-    # заменить одиночные переводы строки на пробел (сохраним абзацы)
+def clean_text(text: str) -> str:
+    t = (text or "").replace("\r", "")
+    t = re.sub(r"-\n", "", t)                                # убрать переносы со знаком дефиса
     t = t.replace("\n\n", "<<<PARA>>>").replace("\n", " ").replace("<<<PARA>>>", "\n\n")
-    # нормализовать пробелы
-    t = " ".join(t.split())
-    # частые замены латиницы на кириллицу (не агрессивно)
-    t = t.translate(_LATIN_TO_CYR)
+    t = re.sub(r"[ \t]+", " ", t)                            # нормализовать пробелы
+    t = t.translate(_LATIN_TO_CYR)                           # частые замены латиницы на кириллицу
     return t.strip()
+
+
+def split_text_to_pages(full_text: str, page_size_chars: int = 1800) -> List[Dict[str, Any]]:
+    """Нарезаем длинный текст на «псевдо-страницы» по символам, стараясь уважать абзацы."""
+    text = clean_text(full_text)
+    if not text:
+        return [{"page": 1, "text": ""}]
+
+    parts: List[str] = []
+    buf = []
+    cur_len = 0
+    # грубо по абзацам/точкам/точкам с запятыми
+    tokens = re.split(r"(\n\n|[.!?]\s+)", text)
+    for t in tokens:
+        if t is None:
+            continue
+        if cur_len + len(t) > page_size_chars and buf:
+            parts.append("".join(buf).strip())
+            buf, cur_len = [t], len(t)
+        else:
+            buf.append(t)
+            cur_len += len(t)
+    if buf:
+        parts.append("".join(buf).strip())
+
+    pages: List[Dict[str, Any]] = []
+    for i, chunk in enumerate(parts, start=1):
+        pages.append({"page": i, "text": chunk})
+
+    return pages or [{"page": 1, "text": text[:page_size_chars]}]
 
 
 # ================== OCR Backends ==================
@@ -178,7 +210,7 @@ def ingest_pdf(
             do_ocr = False
 
         if do_ocr:
-            # Рендер в PIL (dpi влияет лишь на Tesseract; EasyOCR терпим к 2x масштабированию)
+            # Рендер в PIL
             if ocr_backend == "tesseract":
                 zoom = dpi / 72.0
                 mat = fitz.Matrix(zoom, zoom)
@@ -189,7 +221,6 @@ def ingest_pdf(
                 pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
                 img_pil = pixmap_to_pil(pix)
 
-            # Предобработка (OpenCV)
             img_pil = preprocess_pil(img_pil)
 
             if ocr_backend == "easyocr":
@@ -205,27 +236,49 @@ def ingest_pdf(
                 print(f"[OCR-{ocr_backend}] {pdf_path.name} p.{i}: OCR не улучшил текст (len={len(txt)})")
 
         if txt:
-            txt = clean_ocr_text(txt)
+            txt = clean_text(txt)
 
         pages.append({"page": i, "text": txt})
 
     return pages
 
 
-def ingest_docx(docx_path: Path) -> List[Dict[str, Any]]:
-    if not docx:
+def ingest_docx(docx_path: Path, page_size_chars: int = 1800) -> List[Dict[str, Any]]:
+    if Document is None:
         raise RuntimeError("python-docx не установлен (pip install python-docx)")
-    d = docx.Document(str(docx_path))
-    buf = [p.text for p in d.paragraphs]
-    return [{"page": 1, "text": clean_ocr_text("\n".join(buf).strip())}]
+    d = Document(str(docx_path))
+    buf = []
+    for p in d.paragraphs:
+        t = (p.text or "").strip()
+        if t:
+            buf.append(t)
+    full = "\n".join(buf).strip()
+    return split_text_to_pages(full, page_size_chars=page_size_chars)
 
 
-def ingest_txt(txt_path: Path) -> List[Dict[str, Any]]:
+def ingest_txt(txt_path: Path, page_size_chars: int = 1800) -> List[Dict[str, Any]]:
     text = detect_text_file(txt_path).strip()
-    return [{"page": 1, "text": clean_ocr_text(text)}]
+    return split_text_to_pages(text, page_size_chars=page_size_chars)
 
 
 # ================== Основной процесс ==================
+
+def choose_ocr_backend(requested: str) -> str:
+    """
+    Возвращает эффективный backend OCR с учётом доступности библиотек.
+    priority: requested → fallback tesseract → 'none'
+    """
+    req = (requested or "").lower()
+    if req == "easyocr" and EASY_AVAILABLE:
+        return "easyocr"
+    if req == "tesseract" and TESS_AVAILABLE:
+        return "tesseract"
+    if EASY_AVAILABLE:
+        return "easyocr"
+    if TESS_AVAILABLE:
+        return "tesseract"
+    return "none"  # OCR недоступен
+
 
 def process_one_file(
     f: Path,
@@ -234,10 +287,11 @@ def process_one_file(
     force: bool,
     min_chars: int,
     ocr_mode: str,
-    ocr_backend: str,
+    ocr_backend_eff: str,  # уже выбранный эффективный backend
     ocr_lang: str,
     dpi: int,
-    verbose: bool
+    verbose: bool,
+    page_size_chars: int,
 ) -> Dict[str, Any]:
     """Процессинг одного файла (без доступа к manifest). Возвращает entry + путь pages."""
     sha = file_sha1(f)
@@ -247,25 +301,26 @@ def process_one_file(
 
     # OCR init (easyocr локально в процессе)
     easy_reader = None
-    if ocr_mode != "never" and ocr_backend == "easyocr" and EASY_AVAILABLE:
+    if ocr_mode != "never" and ocr_backend_eff == "easyocr":
         use_gpu = False
         try:
             import torch
             use_gpu = torch.cuda.is_available()
         except Exception:
             pass
-        easy_reader = easyocr.Reader(['ru','en'], gpu=use_gpu)
+        easy_reader = easyocr.Reader(['ru', 'en'], gpu=use_gpu)
 
     # Парсинг
-    if f.suffix.lower() == ".pdf":
+    ext = f.suffix.lower()
+    if ext == ".pdf":
         pages = ingest_pdf(
-            f, ocr_mode=ocr_mode, ocr_backend=ocr_backend, ocr_lang=ocr_lang,
+            f, ocr_mode=ocr_mode, ocr_backend=ocr_backend_eff, ocr_lang=ocr_lang,
             dpi=dpi, min_chars=min_chars, verbose=verbose, easy_reader=easy_reader
         )
-    elif f.suffix.lower() == ".docx":
-        pages = ingest_docx(f)
+    elif ext == ".docx":
+        pages = ingest_docx(f, page_size_chars=page_size_chars)
     else:
-        pages = ingest_txt(f)
+        pages = ingest_txt(f, page_size_chars=page_size_chars)
 
     # Сохраняем
     with out_pages.open("w", encoding="utf-8") as w:
@@ -281,7 +336,7 @@ def process_one_file(
         "pages": len(pages),
         "lang": "ru",
         "sha1": sha,
-        "ocr_backend": ocr_backend,
+        "ocr_backend": ocr_backend_eff,
         "ocr_mode": ocr_mode,
         "ocr_lang": ocr_lang,
         "dpi": dpi,
@@ -292,22 +347,24 @@ def process_one_file(
 
 
 def main():
-    ap = argparse.ArgumentParser("RAW -> data/*.pages.jsonl (+manifest) с качественным OCR")
-    ap.add_argument("--input-dir", default="raw_docs", help="Папка с PDF/DOCX/TXT")
+    ap = argparse.ArgumentParser("RAW -> data/*.pages.jsonl (+manifest) с OCR и поддержкой DOCX/TXT")
+    ap.add_argument("--input-dir", default="raw_docs", help="Папка с PDF/DOCX/TXT (рекурсивно)")
     ap.add_argument("--out-dir", default="data", help="Куда сохранять JSONL и manifest.json")
     ap.add_argument("--force", action="store_true", help="Перепарсить даже без изменений")
 
-    # OCR-настройки
-    ap.add_argument("--ocr-mode", choices=["auto","always","never"], default="auto",
+    # OCR-настройки (можно задать через env)
+    ap.add_argument("--ocr-mode", choices=["auto","always","never"], default=os.getenv("OCR_MODE", "auto"),
                     help="auto: только если мало текста; always: OCR на всех страницах; never: без OCR")
-    ap.add_argument("--ocr-backend", choices=["tesseract","easyocr"], default="easyocr",
-                    help="Движок OCR")
-    ap.add_argument("--ocr-lang", default="rus+eng", help="Языки для tesseract (ignored для easyocr)")
-    ap.add_argument("--min-chars", type=int, default=60, help="Порог символов для запуска OCR в режиме auto")
-    ap.add_argument("--dpi", type=int, default=300, help="DPI рендера для tesseract")
+    ap.add_argument("--ocr-backend", choices=["tesseract","easyocr"], default=os.getenv("OCR_BACKEND", "easyocr"),
+                    help="Желаемый движок OCR (будет авто-фоллбек)")
+    ap.add_argument("--ocr-lang", default=os.getenv("TESS_LANG", "rus+eng"), help="Языки для tesseract")
+    ap.add_argument("--min-chars", type=int, default=int(os.getenv("MIN_CHARS", "60")),
+                    help="Порог символов для запуска OCR в режиме auto")
+    ap.add_argument("--dpi", type=int, default=int(os.getenv("OCR_DPI", "300")), help="DPI рендера для tesseract")
 
     # Прочее
     ap.add_argument("--workers", type=int, default=0, help="Параллелизм по файлам (0=CPU count)")
+    ap.add_argument("--page-size-chars", type=int, default=1800, help="Размер «псевдо-страницы» для DOCX/TXT")
     ap.add_argument("--verbose", action="store_true", help="Подробный лог")
 
     args = ap.parse_args()
@@ -316,7 +373,21 @@ def main():
     out_dir = Path(args.out_dir)
     ensure_dir(out_dir)
 
-    files = sorted([p for p in in_dir.iterdir() if p.is_file() and p.suffix.lower() in {".pdf", ".docx", ".txt"}])
+    # Рекурсивно собираем файлы
+    allowed = {".pdf", ".docx", ".txt"}
+    files = []
+    for p in in_dir.rglob("*"):
+        if not p.is_file():
+            continue
+        ext = p.suffix.lower()
+        if ext not in allowed:
+            continue
+        name = p.name
+        if name.startswith("~$"):  # временные файлы MS Office
+            continue
+        files.append(p)
+    files = sorted(files)
+
     if not files:
         print(f"В {in_dir} нет pdf/docx/txt", file=sys.stderr)
         return 1
@@ -335,7 +406,7 @@ def main():
     by_source: Dict[str, Dict[str, Any]] = {d.get("source_path"): d for d in docs if isinstance(d, dict)}
     existing_ids = {d.get("doc_id") for d in docs if isinstance(d, dict)}
 
-    # План работ: перепарсить только изменённые или force
+    # План работ: перепарсить только изменённые/новые или --force
     plan: List[Path] = []
     for f in files:
         sha = file_sha1(f)
@@ -343,22 +414,27 @@ def main():
         if args.force or not prev or prev.get("sha1") != sha:
             plan.append(f)
         elif args.verbose:
-            print(f"→ Без изменений: {f.name}")
+            print(f"→ Без изменений: {f.relative_to(in_dir)}")
 
     if not plan:
         print("Нет изменений — ничего делать не нужно.")
         return 0
 
+    # Эффективный OCR backend с учётом установленного
+    ocr_backend_eff = choose_ocr_backend(args.ocr_backend)
+    if args.verbose and args.ocr_mode != "never":
+        print(f"[INFO] OCR backend: requested={args.ocr_backend}, effective={ocr_backend_eff}")
+
     # Параллелизм по файлам
-    workers = args.workers or max(1, __import__("os").cpu_count() or 1)
+    workers = args.workers or max(1, os.cpu_count() or 1)
     results: List[Dict[str, Any]] = []
 
     if workers <= 1 or len(plan) == 1:
         for f in plan:
             r = process_one_file(
                 f, out_dir, force=args.force, min_chars=args.min_chars,
-                ocr_mode=args.ocr_mode, ocr_backend=args.ocr_backend, ocr_lang=args.ocr_lang,
-                dpi=args.dpi, verbose=args.verbose
+                ocr_mode=args.ocr_mode, ocr_backend_eff=ocr_backend_eff, ocr_lang=args.ocr_lang,
+                dpi=args.dpi, verbose=args.verbose, page_size_chars=args.page_size_chars
             )
             results.append(r)
     else:
@@ -367,8 +443,8 @@ def main():
                 ex.submit(
                     process_one_file, f, out_dir,
                     force=args.force, min_chars=args.min_chars,
-                    ocr_mode=args.ocr_mode, ocr_backend=args.ocr_backend, ocr_lang=args.ocr_lang,
-                    dpi=args.dpi, verbose=args.verbose
+                    ocr_mode=args.ocr_mode, ocr_backend_eff=ocr_backend_eff, ocr_lang=args.ocr_lang,
+                    dpi=args.dpi, verbose=args.verbose, page_size_chars=args.page_size_chars
                 ): f for f in plan
             }
             for fut in as_completed(futs):
@@ -377,11 +453,11 @@ def main():
                 except Exception as e:
                     print(f"[ERR] {futs[fut].name}: {e}", file=sys.stderr)
 
-    # Обновляем manifest
+    # Обновляем manifest и уникализируем doc_id при коллизии
     for r in results:
         src = r["source_path"]
         doc_id = r["doc_id"]
-        # уникализируем doc_id при коллизии
+
         if doc_id in existing_ids:
             base = doc_id
             suf = 2
@@ -404,12 +480,12 @@ def main():
             "pages": r["pages"],
             "lang": "ru",
             "sha1": r["sha1"],
-            "ocr": (args.ocr_mode != "never"),
+            "ocr": (args.ocr_mode != "never" and ocr_backend_eff != "none"),
             "ocr_mode": args.ocr_mode,
-            "ocr_backend": args.ocr_backend,
-            "ocr_lang": args.ocr_lang,
-            "dpi": args.dpi,
-            "min_chars": args.min_chars,
+            "ocr_backend": r["ocr_backend"],
+            "ocr_lang": r["ocr_lang"],
+            "dpi": r["dpi"],
+            "min_chars": r["min_chars"],
             "empty_pages": r["empty_pages"]
         }
         if prev:
