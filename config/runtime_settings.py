@@ -12,10 +12,10 @@ RUNTIME = {
         # если пусто, возьмётся из .env (LLM_BASE_URL)
         # "base_url": "http://host.docker.internal:11434",
         "model": "llama3.1:8b",
-        "max_tokens": 2048,     # сколько токенов генерировать (длина ответа)
-        "timeout_s": 180,       # таймаут HTTP запроса к LLM (секунды)
-        "temperature": 0.4,
-        "top_p": 0.95,
+        "max_tokens": 300,     # сколько токенов генерировать (длина ответа)
+        "timeout_s": 60,       # таймаут HTTP запроса к LLM (секунды)
+        "temperature": 0.1,
+        "top_p": 0.9,
         "num_ctx": 6144,        # контекст (лимит токенов входа)
     },
 
