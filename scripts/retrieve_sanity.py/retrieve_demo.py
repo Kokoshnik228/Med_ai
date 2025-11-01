@@ -55,8 +55,8 @@ def bm25_search(searcher: LuceneSearcher, query: str, topk: int) -> List[Tuple[s
 def main():
     ap = argparse.ArgumentParser(description="Hybrid retrieval demo: Qdrant + BM25 → RRF")
     ap.add_argument("--q", required=True, help="Текст запроса")
-    ap.add_argument("--qdrant", default="http://localhost:7777")
-    ap.add_argument("--collection", default="med_kb")
+    ap.add_argument("--qdrant", default="http://qdrant:6333")
+    ap.add_argument("--collection", default="med_kb_v3")
     ap.add_argument("--bm25-index", default="index/bm25_idx")
     ap.add_argument("--k", type=int, default=10)
     ap.add_argument("--kq", type=int, default=50)

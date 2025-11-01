@@ -12,10 +12,11 @@
     --out-json index/bm25_json --index-dir index/bm25_idx
 """
 from __future__ import annotations
-import argparse, json, subprocess
+import argparse, json, subprocess, re
 from pathlib import Path
 from typing import Dict, Any, List
 from tqdm import tqdm
+from rag.bm25_utils import bm25_search
 
 
 def words(text: str) -> List[str]:
@@ -32,6 +33,26 @@ def chunk_words(tokens: List[str], max_len: int, overlap: int) -> List[List[str]
             break
         i = max(0, j - overlap)
     return chunks
+
+
+def is_noise_text(text: str) -> bool:
+    """
+    Определяет, является ли текст "мусорным" (оглавление, таблица, слишком короткий и т.п.)
+    """
+    if not text or len(text.strip()) < 50:
+        return True
+
+    # много точек и цифр — вероятно, оглавление
+    punct_density = text.count('.') / max(len(text), 1)
+    digit_density = sum(ch.isdigit() for ch in text) / max(len(text), 1)
+    if punct_density > 0.2 and digit_density > 0.1:
+        return True
+
+    # слишком много повторов пунктов "1.1", "2.3" и т.п.
+    if len(re.findall(r'\d+\.\d+', text)) > 10:
+        return True
+
+    return False
 
 
 def main() -> int:
@@ -68,8 +89,9 @@ def main() -> int:
             print(f"⚠️ Пропуск пустого документа: {fp.name}")
             continue
 
-        # создаём файл только если есть чанки
         child_idx = 0
+        kept = 0
+        skipped = 0
         with out_path.open("w", encoding="utf-8") as fout:
             for p in pages:
                 toks = words(p["text"]) if p["text"] else []
@@ -77,9 +99,13 @@ def main() -> int:
                     continue
                 chunks = chunk_words(toks, args.child_w, args.child_overlap)
                 for c_i, chunk in enumerate(chunks, start=1):
-                    child_idx += 1
-                    chunk_id = f"{doc_id}_p{p['page']}_c{c_i}"
                     text = " ".join(chunk)
+                    if is_noise_text(text):
+                        skipped += 1
+                        continue  # пропускаем мусорные чанки
+                    child_idx += 1
+                    kept += 1
+                    chunk_id = f"{doc_id}_p{p['page']}_c{c_i}"
                     obj = {
                         "id": chunk_id,
                         "contents": text,
@@ -91,7 +117,7 @@ def main() -> int:
                     }
                     fout.write(json.dumps(obj, ensure_ascii=False) + "\n")
 
-        print(f"✅ {doc_id} — записано {child_idx} чанков")
+        print(f"✅ {doc_id} — записано {kept} чанков (пропущено {skipped} мусорных)")
 
     # ---- Запуск Lucene индексатора ----
     index_dir = Path(args.index_dir)

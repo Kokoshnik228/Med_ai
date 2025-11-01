@@ -1,0 +1,79 @@
+version: "3.9"
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: medai_qdrant_prod
+    restart: unless-stopped
+    ports:
+      - "7778:6333"              # внешний 7778 → внутренний 6333
+    volumes:
+      - qdrant_storage_prod:/qdrant/storage
+    healthcheck:
+      # сначала пытаемся HTTP, если wget нет — проверяем TCP-порт
+      test: ["CMD-SHELL", "([ -x /usr/bin/wget ] && wget -qO- http://localhost:6333/readyz >/dev/null) || (echo > /dev/tcp/localhost/6333)"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  app:
+    build: .
+    container_name: medai_app_prod
+    restart: unless-stopped
+    depends_on:
+      qdrant:
+        condition: service_healthy
+
+    environment:
+      # --- База знаний ---
+      QDRANT_URL: "http://qdrant:6333"
+      QDRANT_COLLECTION: "med_kb_v3"
+      QDRANT__PREFER_GRPC: "false"     # принудительно HTTP
+
+      # --- Эмбеддинги: HF (GPU) ---
+      EMB_BACKEND: "hf"
+      HF_MODEL: "BAAI/bge-m3"
+      HF_DEVICE: "cuda"                # можно убрать или заменить на "auto"
+
+      # --- Reranker (если используешь) ---
+      RERANKER_MODEL: "BAAI/bge-reranker-v2-m3"
+
+      # --- Конфиг приложения ---
+      APP_ENV: "prod"
+      APP_HOST: "0.0.0.0"
+      APP_PORT: "8000"
+      APP_WORKERS: "2"
+
+      # --- LLM (опционально; по умолчанию в коде host.docker.internal:11434) ---
+      # MODEL_ID: "llama3.1:8b"
+      # LLM_BASE_URL: "http://host.docker.internal:11434"
+
+    ports:
+      - "8050:8000"
+
+    volumes:
+      - ./data:/app/data
+      - ./index:/app/index
+      - ./raw_docs:/app/raw_docs
+
+    command: ["bash", "start.sh"]
+
+    # корректная резолюция host.docker.internal на Linux
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    # GPU для PyTorch/FlagEmbedding (нужен NVIDIA Container Toolkit)
+    gpus: "all"
+    shm_size: "2g"
+
+    # (необязательно) healthcheck самого API
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health >/dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+volumes:
+  qdrant_storage_prod:

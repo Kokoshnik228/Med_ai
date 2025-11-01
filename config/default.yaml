@@ -1,0 +1,19 @@
+app:
+  data_dir: data
+  bm25_index_dir: index/bm25_idx
+
+qdrant:
+  url: http://qdrant:6333
+  collection: med_kb_v3   # <-- новая коллекция под E5
+
+ollama:
+  base_url: http://host.docker.internal:11434
+  model: llama3.1:8b
+
+retrieval:
+  k: 12
+  kq: 80
+  kb: 80
+
+embedding:
+  model: BAAI/bge-m3  # <-- новая модель эмбеддингов

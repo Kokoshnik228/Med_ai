@@ -1,0 +1,61 @@
+
+
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    container_name: medai_qdrant_dev
+    restart: unless-stopped
+    ports:
+      - "7779:6333"               # внешний 7779 → внутр. 6333
+    volumes:
+      - qdrant_storage_dev:/qdrant/storage
+
+  app:
+    build: .
+    container_name: medai_app_dev
+    restart: unless-stopped
+
+    depends_on:
+      qdrant:
+        condition: service_started
+
+    environment:
+      # --- приложение ---
+      APP_ENV: "dev"
+      APP_HOST: "0.0.0.0"
+      APP_PORT: "8000"
+
+      # --- Qdrant (внутри докер-сети) ---
+      QDRANT_URL: "http://qdrant:6333"
+      QDRANT_COLLECTION: "med_kb_v3"
+    
+
+      # --- эмбеддинги ---
+      EMB_BACKEND: "hf"
+      HF_MODEL: "BAAI/bge-m3"
+      HF_DEVICE: "cpu"
+      #NVIDIA_VISIBLE_DEVICES: "all"
+      #NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+
+      # --- LLM на хосте (Ollama) ---
+      LLM_BASE_URL: "http://host.docker.internal:11434"
+      MODEL_ID: "llama3.1:8b"
+
+    ports:
+      - "7050:8000"               # открываем API на 7050 с хоста
+
+    volumes:
+      - ./:/app
+
+    command: ["bash", "start.sh"]
+
+    # GPU для PyTorch/FlagEmbedding
+    #gpus: "all"
+    shm_size: "2g"
+
+    # чтобы резолвился host.docker.internal на Linux
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  qdrant_storage_dev:

@@ -1,30 +1,15 @@
 #!/usr/bin/env python3
-"""
-RAG-анализ медицинского кейса c цитатами из локальной БД.
 
-Требования:
-  - локально запущен Ollama (http://localhost:11434)
-  - есть файл контекста из шага retrieve: out/context.json (список фрагментов)
 
-Вывод:
-  - out/<case_name>.rag.json  — структурированный JSON-ответ модели
-  - out/<case_name>.rag.txt   — краткий человекочитаемый отчёт
-
-Запуск:
-  python analyze_case_rag.py --case cases/case1.txt \
-     --model llama3.1:8b --ollama http://localhost:11434 \
-     --context out/context.json --outdir out
-
-Примечания:
-  - Если хочешь, можешь передавать альтернативный контекст: --context другой_файл.json
-  - Температура низкая (0.1) для стабильного JSON.
-"""
 from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
 import textwrap
 import requests
+from rag.bm25_utils import bm25_search, retrieve_hybrid
+
+
 
 SCHEMA = {
   "type": "object",
@@ -115,7 +100,7 @@ def load_case(path: Path, limit_chars: int = 8000) -> str:
     return txt
 
 
-def build_context(ctx_path: Path, max_chunks: int = 8, chunk_char_limit: int = 1600) -> str:
+def build_context(ctx_path: Path, max_chunks: int = 12, chunk_char_limit: int = 1600) -> str:
     data = json.loads(ctx_path.read_text(encoding="utf-8"))
     lines = []
     for i, item in enumerate(data[:max_chunks], start=1):
@@ -176,7 +161,7 @@ def main() -> int:
     ap.add_argument("--case", required=True, type=Path, help="Путь к кейсу .txt")
     ap.add_argument("--context", default=Path("out/context.json"), type=Path)
     ap.add_argument("--model", default="llama3.1:8b")
-    ap.add_argument("--ollama", default="http://localhost:11434")
+    ap.add_argument("--ollama", default="http://host.docker.internal:11434")
     ap.add_argument("--outdir", default=Path("out"), type=Path)
     args = ap.parse_args()
 

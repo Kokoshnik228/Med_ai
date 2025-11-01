@@ -4,6 +4,7 @@ import json
 from pathlib import Path
 import sys
 
+
 try:
     from ollama import Client, ResponseError  # type: ignore
 except Exception as e:  # pragma: no cover
@@ -74,7 +75,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Анализ клинического кейса через Ollama")
     parser.add_argument("case_file", type=Path, help="Путь к текстовому файлу кейса (.txt)")
     parser.add_argument("--model", default="llama3.1:8b", help="ID модели Ollama (например, llama3.1:8b или llama3.1:70b)")
-    parser.add_argument("--host", default="http://localhost:11434", help="База URL сервера Ollama")
+    parser.add_argument("--host", default="http://host.docker.internal:11434", help="База URL сервера Ollama")
     parser.add_argument("--num_ctx", type=int, default=8192, help="Контекст (токены)")
     parser.add_argument("--temperature", type=float, default=0.0, help="Температура генерации")
     args = parser.parse_args()
@@ -132,6 +133,7 @@ def main() -> int:
     print("Готово. Результат:", out_file)
     print(json.dumps(result_obj, ensure_ascii=False, indent=2))
     return 0
+
 
 
 if __name__ == "__main__":

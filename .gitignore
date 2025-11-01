@@ -50,9 +50,9 @@ junit.xml
 .nfs*
 
 # ── Секреты и локальные конфиги ───────────────────────
-.env
+
 .env.*
-*.env
+
 *.pem
 *.key
 *.p12
@@ -72,6 +72,5 @@ ads/
 index/
 raw_docs/
 cases/
-config/
 out/
 

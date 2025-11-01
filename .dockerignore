@@ -1,0 +1,40 @@
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+
+# большие локальные данные — не нужны при сборке
+raw_docs/
+data/
+index/
+out/
+multilingual-e5-large/
+.raw
+.env*
+.venv
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+.git/
+.gitignore
+*.ipynb
+node_modules/
+dist/
+build/
+
+# огромные каталоги с данными/индексами — не нужны в образе
+raw_docs/
+data/
+index/
+out/
+multilingual-e5-large/
+cases/
+
+# IDE
+.vscode/
+.idea/

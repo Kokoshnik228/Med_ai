@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Быстрый smoke‑test для Qdrant на локальном порту (по умолчанию http://localhost:7777).
-Создаёт коллекцию `med_kb` (1024‑мерные векторы под bge-m3),
+Быстрый smoke‑test для Qdrant на локальном порту (по умолчанию http://qdrant:6333).
+Создаёт коллекцию `med_kb_v3` (1024‑мерные векторы под bge-m3),
 добавляет 3 точки‑заглушки и делает поиск.
 
 Запуск:
-  python qdrant_smoketest.py --url http://localhost:7777 --reset
+  python qdrant_smoketest.py --url http://qdrant:6333 --reset
 """
 from __future__ import annotations
 import argparse
@@ -15,8 +15,8 @@ from qdrant_client.models import Distance, VectorParams, PointStruct
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--url", default="http://localhost:7777", help="URL Qdrant")
-    ap.add_argument("--name", default="med_kb", help="Имя коллекции")
+    ap.add_argument("--url", default="http://qdrant:6333", help="URL Qdrant")
+    ap.add_argument("--name", default="med_kb_v3", help="Имя коллекции")
     ap.add_argument("--reset", action="store_true", help="Пересоздать коллекцию")
     args = ap.parse_args()
 
