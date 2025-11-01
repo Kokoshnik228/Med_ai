@@ -1,6 +1,6 @@
 services:
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:1.15.5
     container_name: medai_qdrant_dev
     restart: unless-stopped
     ports:
@@ -8,10 +8,13 @@ services:
     volumes:
       - qdrant_storage_dev:/qdrant/storage
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/readyz"]
+      # У Qdrant /readyz может возвращать "ok" или "all shards are ready".
+      # Делаем проверку устойчивой и без зависимости от наличия curl в образе.
+      test: ["CMD-SHELL", "wget -qO- http://localhost:6333/readyz 2>/dev/null | grep -Eqi 'ok|ready'"]
       interval: 5s
       timeout: 3s
-      retries: 20
+      retries: 30
+      start_period: 10s
 
   app:
     build: .
@@ -19,32 +22,21 @@ services:
     restart: unless-stopped
     depends_on:
       qdrant:
-        condition: service_healthy
-
-    # читаем переменные из .env.dev (LLM_*, QDRANT_URL, EMBEDDING_MODEL и т.п.)
+        condition: service_healthy   # при желании можно временно заменить на service_started
     env_file:
-      - .env.dev
-
-    # локальные переопределения именно для контейнера (внутренний порт и пр.)
+      - .env.dev                     # LLM_*, QDRANT_URL=http://qdrant:6333 и т.п.
     environment:
       APP_HOST: "0.0.0.0"
-      APP_PORT: "8000"              # ВНУТРИ контейнера слушаем 8000
+      APP_PORT: "8000"               # внутри контейнера слушаем 8000
       LLM_BASE_URL: "http://host.docker.internal:11434"
-
     ports:
-      - "7050:8000"                 # с хоста ходим на 7050
-
+      - "7050:8000"                  # с хоста ходим на 7050
     volumes:
       - ./:/app
-
     command: ["bash", "start.sh"]
-
-    # чтобы резолвился host.docker.internal на Linux
     extra_hosts:
       - "host.docker.internal:host-gateway"
-
-    # --- GPU (необязательно) ---
-    # раскомментируй, если настроен NVIDIA runtime
+    # --- GPU (по желанию) ---
     # gpus: "all"
     # environment:
     #   NVIDIA_VISIBLE_DEVICES: "all"

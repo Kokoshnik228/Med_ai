@@ -6,6 +6,7 @@ config/runtime_settings.py
 2) POST /config/reload (или curl -X POST http://localhost:7050/config/reload)
 """
 
+
 RUNTIME = {
     # ── LLM / Ollama ────────────────────────────────────────────────
     "ollama": {
