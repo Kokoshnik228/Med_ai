@@ -25,6 +25,8 @@ services:
 
     env_file:
       - .env.dev
+      
+    gpus: "all"
 
     environment:
       APP_HOST: "0.0.0.0"
@@ -34,6 +36,7 @@ services:
       # GPU-переменные для nvidia-container-toolkit:
       NVIDIA_VISIBLE_DEVICES: "all"
       NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
+      HF_DEVICE: "cuda"
 
     ports:
       - "7050:8000"                      # host:7050 -> container:8000
@@ -43,7 +46,7 @@ services:
       - easyocr_cache:/root/.EasyOCR
 
     # Доступ к GPU (docker compose v2 + nvidia-container-toolkit на хосте)
-    gpus: "all"
+    #gpus: "all"
 
     command: ["bash", "start.sh"]
 
