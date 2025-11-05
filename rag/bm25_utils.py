@@ -5,7 +5,8 @@
 ДОСТУПНЫЕ ФУНКЦИИ:
   - bm25_search(index_dir: str, query: str, topk: int) -> List[dict]
   - embed_query_hf(query: str, model_name: str, device_hint: Optional[str], use_fp16: bool) -> List[float]
-  - retrieve_hybrid(query: str, k: int, ..., per_doc_limit: int, reranker_enabled: bool=False, rerank_top_k: int=50) -> List[dict]
+  - retrieve_hybrid(query: str, k: int, ..., per_doc_limit: int,
+                    reranker_enabled: bool=False, rerank_top_k: int=50) -> List[dict]
 
 Особенности:
 - BM25 на Pyserini (Lucene). Если рядом с индексом есть meta-json (index/bm25_json/*.json),
@@ -21,7 +22,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import hashlib
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -49,7 +49,33 @@ _TEXT_SNIPPET_LIMIT = 3500   # ограничим текст фрагменто�
 _PER_DOC_LIMIT_DEFAULT = 2   # по умолчанию не брать слишком много чанков из одного дока
 
 
-# -------------------- Вспомогательные --------------------
+# -------------------- Утилиты --------------------
+
+def _normalize_qdrant_url(url_in: Optional[str]) -> str:
+    """
+    Приводим значение переменной/аргумента к валидному виду:
+      - если пусто -> берем из env: QDRANT_URL или QDRANT
+      - если без схемы (нет '://') -> подставляем http://
+      - если что-то вроде 'qdrant:6333' или 'qdrant://qdrant:6333' -> переводим в http://qdrant:6333
+    Разрешенные схемы для клиента: http, https, grpc, grpcs.
+    """
+    url = (url_in or os.getenv("QDRANT_URL") or os.getenv("QDRANT") or "http://qdrant:6333").strip()
+
+    # 'qdrant:6333' -> добавим http://
+    if "://" not in url:
+        return f"http://{url}"
+
+    # 'qdrant://...' -> заменим на http://...
+    if url.lower().startswith("qdrant://"):
+        return "http://" + url[len("qdrant://"):]
+
+    # 'qdrant:...' (маловероятно с ://, но на всякий) -> http
+    if url.lower().startswith("qdrant:"):
+        return "http://" + url[len("qdrant:"):]
+
+    # всё ок
+    return url
+
 
 @lru_cache(maxsize=4)
 def _get_lucene_searcher(index_dir: str):
@@ -59,7 +85,6 @@ def _get_lucene_searcher(index_dir: str):
     if not idx.exists():
         raise FileNotFoundError(f"BM25 индекс не найден: {idx}")
     s = LuceneSearcher(index_dir)
-    # Небольшой тюнинг BM25 — не агрессивный, но обычно работает устойчиво
     try:
         s.set_bm25(k1=0.9, b=0.4)
     except Exception:
@@ -69,10 +94,6 @@ def _get_lucene_searcher(index_dir: str):
 
 @lru_cache(maxsize=4)
 def _load_bm25_meta(index_dir: str) -> Dict[str, Dict[str, Any]]:
-    """
-    Если индекс строился через наш build_bm25.py, рядом должен быть каталог index/bm25_json.
-    В нём — *.json с полями id/doc_id/page/text. Собираем id -> {doc_id,page,text}.
-    """
     base = Path(index_dir)
     meta_dir = base.with_name("bm25_json")
     mapping: Dict[str, Dict[str, Any]] = {}
@@ -82,7 +103,6 @@ def _load_bm25_meta(index_dir: str) -> Dict[str, Dict[str, Any]]:
     for p in meta_dir.glob("*.json"):
         try:
             j = json.loads(p.read_text(encoding="utf-8"))
-            # ожидаем поля: id, doc_id, page, text (или contents)
             doc_id = j.get("doc_id") or "unknown"
             page = int(j.get("page") or 1)
             text = j.get("text") or j.get("contents") or ""
@@ -94,13 +114,6 @@ def _load_bm25_meta(index_dir: str) -> Dict[str, Dict[str, Any]]:
 
 
 def _hit_to_record(searcher, hit, meta_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Преобразуем Lucene hit в {doc_id,page,text}, максимально гибко:
-    1) meta_map[id] (если есть рядом bm25_json)
-    2) raw JSON из Lucene документа (если индексировали JSON и сохраняли raw)
-    3) contents() как текст
-    4) попытка распарсить из docid паттерны вида 'КР123#p5' или 'КР123_p5' и т.п.
-    """
     rec: Dict[str, Any] = {"doc_id": "unknown", "page": 1, "text": ""}
 
     id_str = getattr(hit, "docid", None)
@@ -108,7 +121,6 @@ def _hit_to_record(searcher, hit, meta_map: Dict[str, Dict[str, Any]]) -> Dict[s
         m = meta_map[id_str]
         return {"doc_id": m["doc_id"], "page": int(m["page"] or 1), "text": (m["text"] or "")[:_TEXT_SNIPPET_LIMIT]}
 
-    # Попытка прочитать raw / contents
     try:
         doc = searcher.doc(hit.docid)
         raw = doc.raw() if callable(getattr(doc, "raw", None)) else None
@@ -120,7 +132,6 @@ def _hit_to_record(searcher, hit, meta_map: Dict[str, Dict[str, Any]]) -> Dict[s
                 page = int(j.get("page") or 1)
                 return {"doc_id": str(doc_id), "page": page, "text": str(text)[:_TEXT_SNIPPET_LIMIT]}
             except Exception:
-                # если raw не JSON — упадём в contents()
                 pass
         contents = doc.contents() if callable(getattr(doc, "contents", None)) else None
         if contents:
@@ -128,7 +139,6 @@ def _hit_to_record(searcher, hit, meta_map: Dict[str, Dict[str, Any]]) -> Dict[s
     except Exception:
         pass
 
-    # Фоллбек: из docid достанем doc_id/page
     if id_str:
         m = re.match(r"(.+?)(?:[#_:/-])p?(\d+)$", str(id_str))
         if m:
@@ -176,10 +186,6 @@ def embed_query_hf(
     device_hint: Optional[str] = None,
     use_fp16: bool = False,
 ) -> List[float]:
-    """
-    Простая mean-pooling эмбеддинга через transformers.
-    Если есть CUDA — использует её. Совместимо с BGE-семейством.
-    """
     if not query:
         return []
 
@@ -216,9 +222,6 @@ def _embed_texts(
     use_fp16: bool = False,
     batch_size: int = 16,
 ) -> torch.Tensor:
-    """
-    Батчевый эмбеддинг списка текстов. Возвращает тензор (N, D) на CPU.
-    """
     tok, mdl = _load_hf(model_name)
     device = _select_device(device_hint)
     mdl = mdl.to(device)
@@ -258,10 +261,6 @@ def _qdrant_client(url: str):
 
 
 def _rrf_fusion(runs: List[List[str]], k: int = 60, c: int = 60) -> Dict[str, float]:
-    """
-    Reciprocal Rank Fusion: на вход списки doc_id (без повторов в своём списке).
-    Возвращает {doc_id: score}.
-    """
     scores: Dict[str, float] = {}
     for run in runs:
         for rank, did in enumerate(run[:k], start=1):
@@ -270,9 +269,6 @@ def _rrf_fusion(runs: List[List[str]], k: int = 60, c: int = 60) -> Dict[str, fl
 
 
 def _load_pages_text(pages_dir: Path, doc_id: str, a: int, b: int) -> str:
-    """
-    Собирает текст из data/{doc_id}.pages.jsonl по страницам a..b.
-    """
     pj = pages_dir / f"{doc_id}.pages.jsonl"
     if not pj.exists():
         return ""
@@ -295,10 +291,6 @@ def _load_pages_text(pages_dir: Path, doc_id: str, a: int, b: int) -> str:
 # -------------------- Публичные функции --------------------
 
 def bm25_search(index_dir: str, query: str, topk: int = 50) -> List[Dict[str, Any]]:
-    """
-    Поиск по Lucene (Pyserini). Возвращает список словарей:
-    { "doc_id": str, "page": int, "text": str }
-    """
     if not query:
         return []
     try:
@@ -333,17 +325,19 @@ def retrieve_hybrid(
     hf_device: Optional[str] = None,
     hf_fp16: bool = False,
     per_doc_limit: int = _PER_DOC_LIMIT_DEFAULT,
-    # новые флаги — для совместимости с runtime
     reranker_enabled: bool = False,
     rerank_top_k: int = 50,
 ) -> List[Dict[str, Any]]:
     """
     Гибридный поиск: Qdrant (dense) + BM25 (sparse) + RRF, возвращает до k фрагментов.
-    Если включён pereranок — досортируем кандидатов косинусом к запросу (на том же эмбеддере).
+    Если включён переранкер — досортируем кандидатов косинусом к запросу.
     """
     results: List[Dict[str, Any]] = []
     if k <= 0 or not query:
         return results
+
+    # Нормализуем URL (это уберёт 'Unknown scheme: qdrant' при 'qdrant:6333' и пр.)
+    qdrant_url = _normalize_qdrant_url(qdrant_url)
 
     # ---------- 1) Qdrant (dense) ----------
     qd_docids: List[str] = []
@@ -414,17 +408,15 @@ def retrieve_hybrid(
                 })
                 used_per_doc[did] = used_per_doc.get(did, 0) + 1
 
-    # ---------- 5) Опциональный переранкер (косинус через тот же эмбеддер) ----------
+    # ---------- 5) Опциональный переранкер ----------
     if reranker_enabled and candidates:
         try:
             q_vec = torch.tensor(embed_query_hf(query, model_name=hf_model, device_hint=hf_device, use_fp16=hf_fp16)).unsqueeze(0)
             t_vecs = _embed_texts([c["text"] for c in candidates[:max(rerank_top_k, len(candidates))]],
                                   model_name=hf_model, device_hint=hf_device, use_fp16=hf_fp16)
             if t_vecs.numel() > 0:
-                # нормализация уже есть, так что просто cos = q @ t^T
                 sims = torch.matmul(torch.nn.functional.normalize(q_vec, p=2, dim=1),
                                     torch.nn.functional.normalize(t_vecs, p=2, dim=1).T).squeeze(0)
-                # прицепим и отсортируем
                 for i, s in enumerate(sims.tolist()):
                     candidates[i]["_rerank_score"] = float(s)
                 candidates.sort(key=lambda x: x.get("_rerank_score", 0.0), reverse=True)

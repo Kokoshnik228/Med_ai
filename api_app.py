@@ -607,7 +607,32 @@ def analyze_ep(req: AnalyzeReq):
             t = re.sub(r"\s+", " ", (case_text or "")).strip()
             return t[:200]
 
-        query = req.query or _smart_query(req.case_text)
+        
+        # было: search_q = query
+        MAX_CTX_CHARS = 3000
+
+        diag_part = (query or "").strip()
+        user_part = (user_input_text or "").strip()[:MAX_CTX_CHARS]
+        case_part = (getattr(req, "case_text", "") or "").strip()
+
+        pieces = [p for p in (diag_part, user_part) if p]
+        search_q = "\n".join(pieces) if pieces else _smart_query(case_part)
+
+        # Вызов ретривера: убрали неподдерживаемый аргумент `reranker_model`
+        ctx_items = retrieve_hybrid(
+            query=search_q,
+            k=settings.RETR_TOP_K,
+            bm25_index_dir=settings.BM25_INDEX_DIR,
+            qdrant_url=settings.QDRANT_URL,
+            qdrant_collection=settings.QDRANT_COLLECTION,
+            pages_dir=settings.PAGES_DIR,
+            hf_model=settings.HF_MODEL,
+            hf_device=settings.HF_DEVICE,
+            hf_fp16=settings.HF_FP16,
+            per_doc_limit=settings.RETR_PER_DOC_LIMIT,
+            reranker_enabled=getattr(settings, "RERANKER_ENABLED", False),
+            rerank_top_k=getattr(settings, "RERANK_TOP_K", 50),
+        )
         print("🔍 query =", query)
 
         # --- Извлечение контекста ---
