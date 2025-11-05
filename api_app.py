@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 from glob import glob
 import importlib  # ← для горячей подгрузки runtime_settings.py
+from config.runtime_settings import settings
+
 
 # RAG utils
 from rag.bm25_utils import bm25_search, retrieve_hybrid, embed_query_hf
@@ -608,37 +610,43 @@ def analyze_ep(req: AnalyzeReq):
             return t[:200]
 
         
-        # было: search_q = query
-        MAX_CTX_CHARS = 3000
+        # --- Сбор поискового запроса ---
+        # Из тела запроса:
+        diag_query = (getattr(req, "query", "") or "").strip()       # поле с диагнозом/кодом, если пришло
+        user_input_text = (getattr(req, "case_text", "") or "").strip()  # свободный текст кейса
 
-        diag_part = (query or "").strip()
-        user_part = (user_input_text or "").strip()[:MAX_CTX_CHARS]
-        case_part = (getattr(req, "case_text", "") or "").strip()
+        # Если диагноз не задан — построим запрос из текста кейса (fallback)
+        if diag_query:
+            # Используем и диагноз, и текст кейса
+            search_q = f"{diag_query}\n{user_input_text[:2000]}".strip() if user_input_text else diag_query
+        else:
+            # Нет диагноза: «умный» запрос из текста + сам текст
+            base = _smart_query(user_input_text)
+            search_q = f"{base}\n{user_input_text[:2000]}".strip() if user_input_text else base
 
-        pieces = [p for p in (diag_part, user_part) if p]
-        search_q = "\n".join(pieces) if pieces else _smart_query(case_part)
+        print("🔍 query =", search_q)
 
-        # Вызов ретривера: убрали неподдерживаемый аргумент `reranker_model`
+        # --- Ретрив ---
         ctx_items = retrieve_hybrid(
-            query=search_q,
-            k=settings.RETR_TOP_K,
-            bm25_index_dir=settings.BM25_INDEX_DIR,
-            qdrant_url=settings.QDRANT_URL,
-            qdrant_collection=settings.QDRANT_COLLECTION,
-            pages_dir=settings.PAGES_DIR,
-            hf_model=settings.HF_MODEL,
-            hf_device=settings.HF_DEVICE,
-            hf_fp16=settings.HF_FP16,
-            per_doc_limit=settings.RETR_PER_DOC_LIMIT,
-            reranker_enabled=getattr(settings, "RERANKER_ENABLED", False),
-            rerank_top_k=getattr(settings, "RERANK_TOP_K", 50),
-        )
-        print("🔍 query =", query)
+        search_q,
+        k=settings.RETR_TOP_K,
+        bm25_index_dir=settings.BM25_INDEX_DIR,
+        qdrant_url=settings.QDRANT_URL,
+        qdrant_collection=settings.QDRANT_COLLECTION,
+        pages_dir=settings.PAGES_DIR,
+        hf_model=settings.HF_MODEL,
+        hf_device=settings.HF_DEVICE,
+        hf_fp16=settings.HF_FP16,
+        per_doc_limit=settings.RETR_PER_DOC_LIMIT,
+        reranker_enabled=settings.RERANKER_ENABLED,
+        rerank_top_k=settings.RERANK_TOP_K,
+    )
+
 
         # --- Извлечение контекста ---
         t_r0 = time.perf_counter()
         ctx_items = retrieve_hybrid(
-            query, req.k,
+            search_q, req.k,
             bm25_index_dir = cfg("app", "bm25_index_dir", default="index/bm25_idx"),
             qdrant_url     = cfg("qdrant", "url",        default="http://qdrant:6333"),
             qdrant_collection = cfg("qdrant", "collection", default="med_kb_v3"),
