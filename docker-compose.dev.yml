@@ -9,23 +9,19 @@ services:
       - "7779:6333"                # host:7779 -> container:6333
     volumes:
       - qdrant_storage_dev:/qdrant/storage
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:6333/readyz"]
-      interval: 5s
-      timeout: 3s
-      retries: 20
+   
 
   app:
     build: .
     container_name: medai_app_dev
     restart: unless-stopped
     depends_on:
-      qdrant:
-        condition: service_healthy
+      - qdrant
+        
 
     env_file:
       - .env.dev
-      
+
     gpus: "all"
 
     environment:

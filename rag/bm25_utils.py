@@ -1,276 +1,370 @@
-#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 """
-Инкрементальная сборка BM25 (Lucene/Anserini/Pyserini).
+Утилиты BM25/Hybrid Retrieval для Med_ai.
 
-Берём data/*.pages.jsonl (по одному файлу на документ) и генерим:
-  - index/bm25_json/<doc_id>/*.json   — per-doc/per-page JSON для JsonCollection
-  - index/bm25_idx/                   — Lucene индекс
-  - index/bm25_manifest.json          — манифест с SHA1 по pages.jsonl
+Даёт три публичные функции, которых ждёт api_app.py:
+  - bm25_search(index_dir: str, query: str, topk: int) -> List[dict]
+  - embed_query_hf(query: str, model_name: str, device_hint: Optional[str], use_fp16: bool) -> List[float]
+  - retrieve_hybrid(query: str, k: int, ..., per_doc_limit: int) -> List[dict]
 
-Режимы:
-  --recreate  : полная пересборка индекса (снос index/bm25_idx, генерация JSON для всех, индексирование всего)
-  --append    : (по умолчанию) инкрементально — создать JSON и дозалить в индекс только новые/изменённые документы
-
-Требования:
-  - openjdk установлен (есть в Dockerfile)
-  - pyserini в requirements
-  - Папка с json'ами и индексом доступны на запись
+Особенности:
+- BM25 на Pyserini (Lucene). Если рядом с индексом есть meta-json (index/bm25_json/*.json),
+  берём оттуда doc_id/page/text. Иначе пытаемся распарсить raw из Lucene или docid.
+- Qdrant: лёгкий клиент + query_points().
+- RRF-фьюжн списков (dense+bm25).
+- Максимум совместимости с уже созданными индексами и пайплайном.
 """
 
 from __future__ import annotations
-import argparse
+
 import json
 import os
-import shutil
-import sys
+import re
+from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Tuple
-import hashlib
-import glob
-import subprocess
+from typing import Any, Dict, List, Optional, Tuple
 
-# ------------------------ utils ------------------------
+# ---------- Pyserini (Lucene) ----------
+try:
+    from pyserini.search.lucene import LuceneSearcher  # pyserini>=0.20
+except Exception:
+    LuceneSearcher = None
 
-def read_jsonl_pages(p: Path) -> List[Dict]:
-    out = []
-    with p.open("r", encoding="utf-8", errors="ignore") as f:
-        for ln in f:
-            ln = ln.strip()
-            if not ln:
-                continue
+# ---------- Qdrant ----------
+try:
+    from qdrant_client import QdrantClient
+except Exception:
+    QdrantClient = None  # обработаем ниже
+
+# ---------- HF embedding (Transformers) ----------
+import torch
+from transformers import AutoTokenizer, AutoModel
+
+
+# -------------------- Константы --------------------
+
+_TEXT_SNIPPET_LIMIT = 3500  # ограничим текст фрагментов
+_PER_DOC_LIMIT_DEFAULT = 2  # по умолчанию не брать слишком много чанков из одного дока
+
+
+# -------------------- Вспомогательные --------------------
+
+@lru_cache(maxsize=4)
+def _get_lucene_searcher(index_dir: str):
+    if LuceneSearcher is None:
+        raise RuntimeError("Pyserini/LuceneSearcher не установлен. Проверь requirements и Dockerfile.")
+    idx = Path(index_dir)
+    if not idx.exists():
+        raise FileNotFoundError(f"BM25 индекс не найден: {idx}")
+    s = LuceneSearcher(index_dir)
+    # Небольшой тюнинг BM25 — не агрессивный, но обычно работает устойчиво
+    try:
+        s.set_bm25(k1=0.9, b=0.4)
+    except Exception:
+        pass
+    return s
+
+
+@lru_cache(maxsize=4)
+def _load_bm25_meta(index_dir: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Если индекс строился через наш build_bm25.py, рядом должен быть каталог index/bm25_json.
+    В нём — *.json с полями id/doc_id/page/text. Собираем id -> {doc_id,page,text}.
+    """
+    base = Path(index_dir)
+    meta_dir = base.with_name("bm25_json")
+    mapping: Dict[str, Dict[str, Any]] = {}
+    if not meta_dir.exists():
+        return mapping
+
+    for p in meta_dir.glob("*.json"):
+        try:
+            j = json.loads(p.read_text(encoding="utf-8"))
+            # ожидаем поля: id, doc_id, page, text
+            doc_id = j.get("doc_id") or "unknown"
+            page = int(j.get("page") or 1)
+            text = j.get("text") or j.get("contents") or ""
+            _id = j.get("id") or f"{doc_id}#p{page}"
+            mapping[str(_id)] = {"doc_id": doc_id, "page": page, "text": text}
+        except Exception:
+            continue
+    return mapping
+
+
+def _hit_to_record(s, hit, meta_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Преобразуем Lucene hit в {doc_id,page,text}, максимально гибко:
+    1) meta_map[id] (если есть рядом bm25_json)
+    2) raw JSON из Lucene документа (если индексировали JSON и сохраняли raw)
+    3) попытка распарсить из docid паттерны вида 'КР123#p5' или 'КР123_p5' и т.п.
+    """
+    rec: Dict[str, Any] = {"doc_id": "unknown", "page": 1, "text": ""}
+
+    # id строки у Pyserini
+    id_str = getattr(hit, "docid", None) or getattr(hit, "docid", None)
+    if id_str and id_str in meta_map:
+        return {
+            "doc_id": meta_map[id_str]["doc_id"],
+            "page": int(meta_map[id_str]["page"] or 1),
+            "text": (meta_map[id_str]["text"] or "")[:_TEXT_SNIPPET_LIMIT],
+        }
+
+    # Попытка прочитать raw
+    try:
+        doc = s.doc(hit.docid)
+        raw = doc.raw() if callable(getattr(doc, "raw", None)) else getattr(doc, "raw", "")
+        if raw:
             try:
-                obj = json.loads(ln)
-                out.append(obj)
+                j = json.loads(raw)
+                text = j.get("text") or j.get("contents") or ""
+                doc_id = j.get("doc_id") or j.get("id") or "unknown"
+                page = int(j.get("page") or 1)
+                rec = {"doc_id": doc_id, "page": page, "text": text[:_TEXT_SNIPPET_LIMIT]}
+                return rec
             except Exception:
-                continue
+                # если raw не JSON — просто сохраним как текст
+                rec["text"] = str(raw)[:_TEXT_SNIPPET_LIMIT]
+    except Exception:
+        pass
+
+    # Фоллбек: пытаемся вытащить doc_id/page из самого docid
+    if id_str:
+        m = re.match(r"(.+?)(?:[#_:/-])p?(\d+)$", str(id_str))
+        if m:
+            rec["doc_id"] = m.group(1)
+            try:
+                rec["page"] = int(m.group(2))
+            except Exception:
+                rec["page"] = 1
+        else:
+            rec["doc_id"] = str(id_str)
+
+    return rec
+
+
+# -------------------- Публичные функции --------------------
+
+def bm25_search(index_dir: str, query: str, topk: int = 50) -> List[Dict[str, Any]]:
+    """
+    Поиск по Lucene (Pyserini). Возвращает список словарей:
+    { "doc_id": str, "page": int, "text": str }
+    """
+    if not query:
+        return []
+    try:
+        s = _get_lucene_searcher(index_dir)
+    except Exception as e:
+        print(f"⚠️ BM25 недоступен: {e}")
+        return []
+
+    meta = _load_bm25_meta(index_dir)
+    try:
+        hits = s.search(query, topk)
+    except Exception as e:
+        print(f"⚠️ BM25 search error: {e}")
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for h in hits:
+        rec = _hit_to_record(s, h, meta)
+        out.append(rec)
     return out
 
-def sha1_file(p: Path) -> str:
-    h = hashlib.sha1()
-    with p.open("rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
-def ensure_dir(p: Path):
-    p.mkdir(parents=True, exist_ok=True)
+# ---- Embedding (HF Transformers, mean pooling) ----
 
-def rm_tree(p: Path):
-    if p.exists():
-        shutil.rmtree(p)
+@lru_cache(maxsize=2)
+def _load_hf(model_name: str) -> Tuple[AutoTokenizer, AutoModel]:
+    tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    mdl = AutoModel.from_pretrained(model_name, trust_remote_code=True)
+    mdl.eval()
+    return tok, mdl
 
-def hardlink_or_copy(src: Path, dst: Path):
-    ensure_dir(dst.parent)
-    try:
-        os.link(src, dst)  # экономим место и время
-    except OSError:
-        shutil.copy2(src, dst)
 
-# --------------------- json writer ---------------------
+def _mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    mask = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
+    summed = torch.sum(last_hidden_state * mask, dim=1)
+    counts = torch.clamp(mask.sum(dim=1), min=1e-9)
+    return summed / counts
 
-def write_doc_pages_json(
-    pages: List[Dict],
-    out_root: Path,
-    doc_id: str
-) -> List[Path]:
+
+def embed_query_hf(
+    query: str,
+    model_name: str = "BAAI/bge-m3",
+    device_hint: Optional[str] = None,
+    use_fp16: bool = False,
+) -> List[float]:
     """
-    Для документа doc_id создаём набор JSON-файлов формата JsonCollection:
-      { "id": "<doc_id>#p<page>", "contents": "<text>", "raw": "{\"doc_id\":...,\"page\":...}" }
-    Возвращаем список файлов, которые записали.
+    Простая mean-pooling эмбеддинга через transformers.
+    Если есть CUDA — использует её. Совместимо с BGE-семейством.
     """
-    dst_dir = out_root / doc_id
-    if dst_dir.exists():
-        # документ обновился — удаляем старые страницы, чтобы не осталось мусора
-        shutil.rmtree(dst_dir)
-    ensure_dir(dst_dir)
+    if not query:
+        return []
 
-    written: List[Path] = []
-    for rec in pages:
-        page = int(rec.get("page", 1) or 1)
-        text = (rec.get("text") or "").strip()
-        # даже пустые страницы создадим (потом можно фильтровать при поиске)
-        obj = {
-            "id": f"{doc_id}#p{page}",
-            "contents": text,
-            "raw": json.dumps({"doc_id": doc_id, "page": page}, ensure_ascii=False),
-        }
-        out_file = dst_dir / f"{doc_id}_p{page}.json"
-        out_file.write_text(json.dumps(obj, ensure_ascii=False), encoding="utf-8")
-        written.append(out_file)
-    return written
+    tok, mdl = _load_hf(model_name)
+    device = device_hint or ("cuda" if torch.cuda.is_available() else "cpu")
+    mdl = mdl.to(device)
+    if use_fp16 and device == "cuda":
+        mdl = mdl.half()
 
-# --------------------- manifest ------------------------
+    with torch.no_grad():
+        enc = tok(
+            query,
+            max_length=512,
+            padding=True,
+            truncation=True,
+            return_tensors="pt",
+        )
+        enc = {k: v.to(device) for k, v in enc.items()}
+        out = mdl(**enc)
+        if hasattr(out, "last_hidden_state"):
+            emb = _mean_pool(out.last_hidden_state, enc["attention_mask"])
+        elif isinstance(out, (list, tuple)):
+            emb = _mean_pool(out[0], enc["attention_mask"])
+        else:
+            raise RuntimeError("Не удалось получить last_hidden_state из модели.")
+        emb = torch.nn.functional.normalize(emb, p=2, dim=1).squeeze(0).float().cpu().tolist()
+        return emb
 
-def load_manifest(p: Path) -> Dict:
-    if not p.exists():
-        return {"docs": {}}
+
+# ---- Qdrant ----
+
+@lru_cache(maxsize=2)
+def _qdrant_client(url: str):
+    if QdrantClient is None:
+        raise RuntimeError("qdrant-client не установлен.")
+    # В Dev у нас REST, поэтому PREFER_GRPC=false
+    prefer_grpc = (os.getenv("QDRANT__PREFER_GRPC", "false").lower() == "true")
+    return QdrantClient(url=url, prefer_grpc=prefer_grpc)
+
+
+def _rrf_fusion(runs: List[List[str]], k: int = 60, c: int = 60) -> Dict[str, float]:
+    """
+    Reciprocal Rank Fusion: на вход списки doc_id (без повторов в своём списке).
+    Возвращает {doc_id: score}.
+    """
+    scores: Dict[str, float] = {}
+    for run in runs:
+        for rank, did in enumerate(run[:k], start=1):
+            scores[did] = scores.get(did, 0.0) + 1.0 / (c + rank)
+    return scores
+
+
+def _load_pages_text(pages_dir: Path, doc_id: str, a: int, b: int) -> str:
+    """
+    Собирает текст из data/{doc_id}.pages.jsonl по страницам a..b.
+    """
+    pj = pages_dir / f"{doc_id}.pages.jsonl"
+    if not pj.exists():
+        return ""
+    want = set(range(int(a), int(b) + 1))
+    out: List[str] = []
     try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-        if not isinstance(data, dict) or "docs" not in data:
-            return {"docs": {}}
-        if not isinstance(data["docs"], dict):
-            data["docs"] = {}
-        return data
+        with pj.open("r", encoding="utf-8") as r:
+            for line in r:
+                j = json.loads(line)
+                p = int(j.get("page") or 1)
+                if p in want:
+                    t = j.get("text") or ""
+                    if t:
+                        out.append(str(t))
+        return "\n\n".join(out)
     except Exception:
-        return {"docs": {}}
+        return ""
 
-def save_manifest(p: Path, data: Dict):
-    ensure_dir(p.parent)
-    p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
 
-# --------------------- indexer -------------------------
-
-def run_pyserini_indexer(
-    input_dir: Path,
-    index_dir: Path,
-    threads: int = 8,
-    language: str = "ru",
-    append: bool = False
-):
+def retrieve_hybrid(
+    query: str,
+    k: int,
+    *,
+    bm25_index_dir: str = "index/bm25_idx",
+    qdrant_url: str = "http://qdrant:6333",
+    qdrant_collection: str = "med_kb_v3",
+    pages_dir: str = "data",
+    hf_model: str = "BAAI/bge-m3",
+    hf_device: Optional[str] = None,
+    hf_fp16: bool = False,
+    per_doc_limit: int = _PER_DOC_LIMIT_DEFAULT,
+) -> List[Dict[str, Any]]:
     """
-    Вызываем Pyserini/Anserini индексатор.
-    Важное: для append используем отдельную input_dir, где лежат ТОЛЬКО новые/изменённые документы.
+    Гибридный поиск: Qdrant (dense) + BM25 (sparse) + RRF, возвращает до k фрагментов.
     """
-    cmd = [
-        sys.executable, "-m", "pyserini.index.lucene",
-        "--collection", "JsonCollection",
-        "--input", str(input_dir),
-        "--index", str(index_dir),
-        "--generator", "DefaultLuceneDocumentGenerator",
-        "--threads", str(threads),
-        "--storePositions", "--storeDocvectors", "--storeRaw",
-        "--language", language,
-    ]
-    if append:
-        cmd.append("--append")
+    results: List[Dict[str, Any]] = []
+    if k <= 0 or not query:
+        return results
 
-    print("▶️  INDEX:", " ".join(cmd))
-    subprocess.run(cmd, check=True)
+    # ---------- 1) Qdrant (dense) ----------
+    qd_docids: List[str] = []
+    qd_payload_first: Dict[str, Dict[str, Any]] = {}
+    try:
+        vec = embed_query_hf(query, model_name=hf_model, device_hint=hf_device, use_fp16=hf_fp16)
+        client = _qdrant_client(qdrant_url)
+        pts = client.query_points(
+            collection_name=qdrant_collection,
+            query=vec,
+            limit=max(k * 4, 40)
+        ).points
+        for p in pts:
+            pl = p.payload or {}
+            did = str(pl.get("doc_id") or "unknown")
+            if did not in qd_payload_first:
+                qd_payload_first[did] = pl
+                qd_docids.append(did)
+    except Exception as e:
+        print("⚠️ Qdrant retrieve error:", e)
 
-# ---------------------- main --------------------------
+    # ---------- 2) BM25 (sparse) ----------
+    bm_docids: List[str] = []
+    bm_first: Dict[str, Dict[str, Any]] = {}
+    try:
+        hits = bm25_search(bm25_index_dir, query, topk=max(k * 4, 40))
+        for h in hits:
+            did = str(h.get("doc_id") or "unknown")
+            if did not in bm_first:
+                bm_first[did] = h
+                bm_docids.append(did)
+    except Exception as e:
+        print("⚠️ BM25 retrieve error:", e)
 
-def main() -> int:
-    ap = argparse.ArgumentParser("BM25 builder (incremental)")
-    ap.add_argument("--pages-glob", default="data/*.pages.jsonl",
-                    help="Глоб по файлам страниц (по одному jsonl на документ)")
-    ap.add_argument("--out-json", default="index/bm25_json",
-                    help="Куда класть per-doc JSON для JsonCollection")
-    ap.add_argument("--index-dir", default="index/bm25_idx",
-                    help="Папка Lucene индекса")
-    ap.add_argument("--threads", type=int, default=max(2, (os.cpu_count() or 4) // 2))
-    ap.add_argument("--language", default="ru", help="Язык для анализатора Lucene (напр., ru, en)")
-    ap.add_argument("--recreate", action="store_true", help="Полная пересборка")
-    ap.add_argument("--append", dest="append", action="store_true", help="Инкрементальная индексация (по умолчанию)")
-    ap.add_argument("--only-new", dest="append", action="store_true", help="Синоним append")
-    ap.set_defaults(append=True)
+    # ---------- 3) RRF ----------
+    fused = _rrf_fusion([qd_docids, bm_docids])
+    top_docids = [did for did, _ in sorted(fused.items(), key=lambda x: x[1], reverse=True)]
 
-    args = ap.parse_args()
+    # ---------- 4) Сбор контента ----------
+    pages_dir_p = Path(pages_dir)
+    used_per_doc: Dict[str, int] = {}
 
-    pages_files = sorted(glob.glob(args.pages_glob))
-    if not pages_files:
-        print(f"❌ Не найдено файлов по шаблону: {args.pages_glob}", file=sys.stderr)
-        return 1
+    for did in top_docids:
+        if len(results) >= k:
+            break
 
-    out_json_root = Path(args.out_json)
-    index_dir = Path(args.index_dir)
-    manifest_path = out_json_root / "bm25_manifest.json"
-    stage_dir = out_json_root.parent / "_bm25_stage"  # временная папка для новых/изменённых
+        # BM25-чанк (узкий, обычно конкретная страница)
+        if did in bm_first and used_per_doc.get(did, 0) < per_doc_limit:
+            h = bm_first[did]
+            rec = {
+                "doc_id": did,
+                "page_start": int(h.get("page") or 1),
+                "page_end": int(h.get("page") or 1),
+                "text": (h.get("text") or "")[:_TEXT_SNIPPET_LIMIT],
+            }
+            results.append(rec)
+            used_per_doc[did] = used_per_doc.get(did, 0) + 1
+            if len(results) >= k:
+                break
 
-    ensure_dir(out_json_root)
+        # Qdrant «окно страниц»
+        if did in qd_payload_first and used_per_doc.get(did, 0) < per_doc_limit:
+            pl = qd_payload_first[did]
+            a = int(pl.get("page_start", 1) or 1)
+            b = int(pl.get("page_end", a) or a)
+            text = _load_pages_text(pages_dir_p, did, a, b) or _load_pages_text(pages_dir_p, did, 1, 1)
+            if text:
+                results.append({
+                    "doc_id": did,
+                    "page_start": a,
+                    "page_end": b,
+                    "text": text[:_TEXT_SNIPPET_LIMIT],
+                })
+                used_per_doc[did] = used_per_doc.get(did, 0) + 1
 
-    # Загружаем текущий манифест
-    manifest = load_manifest(manifest_path)
-    docs_state: Dict[str, Dict] = manifest.get("docs", {})
-
-    # Сбор списка документов (doc_id -> (pages_path, sha1))
-    docs_found: Dict[str, Tuple[Path, str]] = {}
-    for pth in pages_files:
-        p = Path(pth)
-        # doc_id берём из самого файла (строки jsonl содержат doc_id)
-        try:
-            first_line = next(iter(read_jsonl_pages(p)), None)
-            if not first_line:
-                continue
-            doc_id = str(first_line.get("doc_id") or p.stem)
-        except StopIteration:
-            continue
-        sha = sha1_file(p)
-        docs_found[doc_id] = (p, sha)
-
-    if args.recreate:
-        print("♻️  Полная пересборка: очищаем индекс и json…")
-        rm_tree(index_dir)
-        # JSON перегенерим для всех документов
-        to_generate = list(docs_found.items())
-        # чистим старые per-doc подкаталоги (кроме служебных)
-        for child in out_json_root.iterdir():
-            if child.is_dir() and child.name not in (".", ".."):
-                shutil.rmtree(child)
-        docs_state = {}
-    else:
-        # инкрементально: берём только новые/изменённые
-        to_generate = []
-        for doc_id, (pages_path, sha) in docs_found.items():
-            prev = docs_state.get(doc_id)
-            if not prev or prev.get("pages_sha1") != sha:
-                to_generate.append((doc_id, (pages_path, sha)))
-
-    print(f"📄 Всего документов: {len(docs_found)}; к генерации: {len(to_generate)}")
-
-    # Генерим per-doc JSON
-    generated_any = False
-    for i, (doc_id, (pages_path, sha)) in enumerate(to_generate, 1):
-        pages = read_jsonl_pages(pages_path)
-        # safety: сортируем по page
-        pages.sort(key=lambda r: int(r.get("page", 1) or 1))
-        written = write_doc_pages_json(pages, out_json_root, doc_id)
-        docs_state[doc_id] = {
-            "pages_sha1": sha,
-            "json_count": len(written),
-            "json_dir": str((out_json_root / doc_id).resolve()),
-            "pages_file": str(pages_path.resolve()),
-        }
-        generated_any = True
-        if i % 20 == 0 or i == len(to_generate):
-            print(f"  └─ [{i}/{len(to_generate)}] {doc_id}: страниц={len(written)}")
-
-    # Сохраняем манифест
-    manifest["docs"] = docs_state
-    save_manifest(manifest_path, manifest)
-
-    # Индексация
-    if args.recreate:
-        # индексируем весь out_json_root
-        run_pyserini_indexer(out_json_root, index_dir, threads=args.threads,
-                             language=args.language, append=False)
-        print("✅ Полная пересборка BM25 завершена.")
-        return 0
-
-    if not generated_any:
-        print("⏭️  Нет новых/изменённых документов — пересборка индекса не требуется.")
-        return 0
-
-    # Создаём stage с ТОЛЬКО новыми/изменёнными документами
-    if stage_dir.exists():
-        shutil.rmtree(stage_dir)
-    ensure_dir(stage_dir)
-    for doc_id, (_pages_path, _sha) in to_generate:
-        src_dir = out_json_root / doc_id
-        dst_dir = stage_dir / doc_id
-        ensure_dir(dst_dir)
-        for jf in src_dir.glob("*.json"):
-            hardlink_or_copy(jf, dst_dir / jf.name)
-
-    # append индексирование из stage
-    run_pyserini_indexer(stage_dir, index_dir, threads=args.threads,
-                         language=args.language, append=True)
-
-    # убираем stage
-    shutil.rmtree(stage_dir, ignore_errors=True)
-
-    print("✅ Инкрементальное обновление BM25 завершено.")
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+    return results
