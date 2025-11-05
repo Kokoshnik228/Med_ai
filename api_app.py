@@ -27,17 +27,35 @@ from pydantic import BaseModel, Field
 # ================================
 # .env загрузка (dev/prod)
 # ================================
+import os
+from pathlib import Path
+# ... остальные стандартные импорты выше или ниже — неважно, главное чтобы до использования settings
+
+# ---- load .env, затем загрузить runtime_settings, затем продавить значения из файла в env ----
 try:
     from dotenv import load_dotenv
+
     _env_mode = (os.getenv("APP_ENV") or "dev").strip().lower()
     _env_file = Path(".env.dev" if _env_mode == "dev" else ".env.prod")
+
     if _env_file.exists():
         load_dotenv(dotenv_path=_env_file)
         print(f"🔧 Loaded env: {_env_file}")
     else:
         print(f"⚠️ Env file not found: {_env_file} (fallback to process env)")
+
+    # Импортируем настройки ПОСЛЕ загрузки .env
+    from config.runtime_settings import settings
+
+    # ФАЙЛ — ГЛАВНЫЙ источник: насильно пробрасываем значения из runtime в окружение
+    settings.apply_env(force=True)
+
+    # Для контроля — печать активных значений
+    settings.pretty_print()
+
 except Exception as _e:
-    print(f"⚠️ dotenv load skipped: {_e}")
+    print(f"⚠️ dotenv/runtime settings init skipped: {_e}")
+
 
 # Нормализация env
 if os.getenv("EMBEDDING_MODEL") and not os.getenv("HF_MODEL"):
