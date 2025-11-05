@@ -12,30 +12,51 @@ ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Системные пакеты для Pyserini (JDK), OCR (tesseract + языки), рендера (libgl1),
-# OpenCV (libglib2.0-0), диагностики (curl), и bash для скриптов
+# ---- системные пакеты ----
+# JDK для Pyserini/Lucene, tesseract + рус/анг языки, GL/GLib для opencv,
+# curl/ca-certificates для скачивания моделей EasyOCR, bash для скриптов
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      openjdk-21-jdk-headless \
+      openjdk-21-jre-headless \
       tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus \
       libgl1 libglib2.0-0 \
       curl ca-certificates \
       bash \
     && rm -rf /var/lib/apt/lists/*
 
-# Виртуалка для зависимостей
+# Виртуальное окружение
 RUN python -m venv /opt/venv
 ENV PATH="/opt/venv/bin:$PATH"
 
-# Устанавливаем PyTorch с CUDA 12.1 (официальный канал PyTorch)
-# (Колёса содержат CUDA-рантайм; на хосте нужен NVIDIA драйвер + gpus: "all" в compose)
+# ------------ PyTorch вариант ------------
+# Выбор варианта на этапе сборки:
+#   --build-arg TORCH_VARIANT=cpu    (по умолчанию)
+#   --build-arg TORCH_VARIANT=cu121  (если нужен CUDA 12.1)
+ARG TORCH_VARIANT=cpu
+ARG TORCH_VERSION=2.3.*
+
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu121 \
-    "torch==2.3.*"
+    if [ "$TORCH_VARIANT" = "cu121" ]; then \
+      pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cu121 "torch==${TORCH_VERSION}"; \
+    else \
+      pip install --no-cache-dir "torch==${TORCH_VERSION}"; \
+    fi
 
 # Остальные Python-зависимости
 COPY requirements.txt .
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --no-cache-dir -r requirements.txt
+
+# ---- подготовка EasyOCR моделей (чтобы не качались в рантайме) ----
+ENV EASY_OCR_HOME=/root/.EasyOCR
+RUN mkdir -p /root/.EasyOCR && \
+    python - <<'PY'
+import os
+os.environ['EASY_OCR_HOME'] = os.path.expanduser('~/.EasyOCR')
+import easyocr
+# без GPU, просто загрузка моделей на слой образа
+reader = easyocr.Reader(['ru','en'], gpu=False, download_enabled=True)
+print("EasyOCR models ready at:", os.environ['EASY_OCR_HOME'])
+PY
 
 
 ############################
@@ -44,23 +65,26 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 FROM python:3.11-slim AS runtime
 WORKDIR /app
 
-# На runtime тоже нужны JDK, tesseract, libgl1/libglib2.0-0, curl и bash
+# те же системные пакеты нужны в рантайме
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      openjdk-21-jdk-headless \
+      openjdk-21-jre-headless \
       tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus \
       libgl1 libglib2.0-0 \
       curl ca-certificates \
       bash \
     && rm -rf /var/lib/apt/lists/*
 
-# JAVA_HOME для pyserini/pyjnius
+# JAVA_HOME для Pyserini, Tesseract/ocr env
 ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
 ENV PATH="${JAVA_HOME}/bin:/opt/venv/bin:${PATH}" \
+    TESSDATA_PREFIX=/usr/share/tesseract-ocr/4.00/tessdata \
     PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    EASY_OCR_HOME=/root/.EasyOCR
 
-# Переносим venv со всеми установленными пакетами
+# Переносим venv и предзагруженные модели EasyOCR
 COPY --from=deps /opt/venv /opt/venv
+COPY --from=deps /root/.EasyOCR /root/.EasyOCR
 
 # Копируем код после зависимостей (лучший build cache)
 COPY . .

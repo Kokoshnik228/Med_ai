@@ -1,35 +1,55 @@
+version: "3.9"
+
 services:
   qdrant:
-    image: qdrant/qdrant:v1.15.5
+    image: qdrant/qdrant:latest
     container_name: medai_qdrant_dev
     restart: unless-stopped
     ports:
-      - "7779:6333"
+      - "7779:6333"                # host:7779 -> container:6333
     volumes:
       - qdrant_storage_dev:/qdrant/storage
-    # healthcheck удалён — некоторые сборки не содержат curl/wget
+    healthcheck:
+      # у qdrant есть /readyz; увеличили терпимость и стартовый период
+      test: ["CMD", "curl", "-fsS", "http://localhost:6333/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 40
+      start_period: 20s
 
   app:
-    build: .
+    build:
+      context: .
+      args:
+        # CPU по умолчанию. Для GPU собери: TORCH_VARIANT=cu121
+        TORCH_VARIANT: "cpu"
     container_name: medai_app_dev
     restart: unless-stopped
     depends_on:
       qdrant:
-        condition: service_started   # больше не ждём healthcheck
+        condition: service_healthy
+
     env_file:
       - .env.dev
+
     environment:
       APP_HOST: "0.0.0.0"
       APP_PORT: "8000"
       LLM_BASE_URL: "http://host.docker.internal:11434"
+      EASY_OCR_HOME: "/root/.EasyOCR"   # путь должен совпадать с Dockerfile
+
     ports:
-      - "7050:8000"
+      - "7050:8000"                # host:7050 -> container:8000
+
     volumes:
       - ./:/app
-      - easyocr_cache:/root/.EasyOCR
+      - easyocr_cache:/root/.EasyOCR   # кеш EasyOCR теперь объявлен и не «undefined»
+
     command: ["bash", "start.sh"]
+
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
 volumes:
   qdrant_storage_dev:
+  easyocr_cache:

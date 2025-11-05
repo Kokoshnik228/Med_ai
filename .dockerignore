@@ -38,3 +38,22 @@ cases/
 # IDE
 .vscode/
 .idea/
+
+.git
+.gitignore
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+env/
+.raw/
+raw_docs/
+data/
+index/
+out/
+storage/
+.qdrant/
+EasyOCR/
+*.log
+*.ipynb_checkpoints
+node_modules/

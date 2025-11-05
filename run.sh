@@ -10,8 +10,8 @@ usage() {
 ⚙️  Использование: ./run.sh [dev|prod] [up|down|rebuild|restart|logs|logs-app|ps|sh|env|set-emb|health|pull|build|down-v] [опции]
 
 Примеры:
-  ./run.sh dev                  # Запуск dev
-  ./run.sh prod                 # Запуск prod
+  ./run.sh dev                  # Запуск dev (БЕЗ сборки)
+  ./run.sh prod                 # Запуск prod (со сборкой)
   ./run.sh dev down             # Остановить dev
   ./run.sh prod rebuild         # Пересобрать и перезапустить prod
   ./run.sh dev logs             # Логи всех сервисов (Ctrl+C для выхода)
@@ -69,15 +69,12 @@ _sed_in_place() {
   # _sed_in_place <file> <sed_script>
   local file="$1"; shift
   if sed --version >/dev/null 2>&1; then
-    # GNU sed
-    sed -i "$@" "$file"
+    sed -i "$@" "$file"        # GNU sed
   else
-    # BSD/macOS sed
-    sed -i '' "$@" "$file"
+    sed -i '' "$@" "$file"     # BSD/macOS sed
   fi
 }
 
-# подавление спецсимволов для regex-границ
 _escape_regex() { printf '%s' "$1" | sed -e 's/[]\/$*.^|[]/\\&/g'; }
 
 # безопасная подстановка key=val (создаём ключ, если его нет)
@@ -94,11 +91,9 @@ set_kv() {
 # чтение значения (игнор комментов, пробелы вокруг '=')
 get_kv() {
   local file="$1" key="$2"
-  local key_re="$(_escape_regex "$key")"
   awk -F= -v k="$key" '
     $0 !~ /^[[:space:]]*#/ && $1 ~ "^[[:space:]]*"k"[[:space:]]*$" {
-      sub(/^[[:space:]]+/, "", $2); sub(/[[:space:]]+$/, "", $2);
-      print $2
+      sub(/^[[:space:]]+/, "", $2); sub(/[[:space:]]+$/, "", $2); print $2
     }' "$file" | tail -n1
 }
 
@@ -165,13 +160,25 @@ case "$MODE" in
   prod) APP_URL="${APP_URL:-http://localhost:8050}" ;;
 esac
 
+_has_jq() { command -v jq >/dev/null 2>&1; }
+
 case "$ACTION" in
   up)
     echo "🚀 Запуск $MODE-среды..."
-    "${DCMD[@]}" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d --build
+    if [[ "$MODE" == "dev" ]]; then
+      # В dev НЕ строим образы по умолчанию
+      "${DCMD[@]}" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d --no-build
+    else
+      # В prod по умолчанию строим (как и раньше)
+      "${DCMD[@]}" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d --build
+    fi
     echo "⏳ Проверка здоровья сервиса..."
     if command -v curl >/dev/null 2>&1; then
-      curl -fsS "${APP_URL%/}/health" | jq . 2>/dev/null || curl -fsS "${APP_URL%/}/health" || true
+      if _has_jq; then
+        curl -fsS "${APP_URL%/}/health" | jq . || true
+      else
+        curl -fsS "${APP_URL%/}/health" || true
+      fi
     fi
     echo "✅ Готово. Сервис: ${APP_URL}"
     ;;
@@ -217,7 +224,12 @@ case "$ACTION" in
   health)
     echo "🩺 Проверка сервисов ($MODE)..."
     if command -v curl >/dev/null 2>&1; then
-      echo "— app health:" && (curl -fsS "${APP_URL%/}/health" | jq . 2>/dev/null || curl -fsS "${APP_URL%/}/health" || true)
+      echo "— app health:"
+      if _has_jq; then
+        (curl -fsS "${APP_URL%/}/health" | jq .) || true
+      else
+        curl -fsS "${APP_URL%/}/health" || true
+      fi
     fi
     ;;
   *)
