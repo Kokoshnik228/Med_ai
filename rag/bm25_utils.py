@@ -368,3 +368,4 @@ def retrieve_hybrid(
                 used_per_doc[did] = used_per_doc.get(did, 0) + 1
 
     return results
+
