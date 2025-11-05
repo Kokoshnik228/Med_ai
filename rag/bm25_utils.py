@@ -2,17 +2,18 @@
 """
 Утилиты BM25/Hybrid Retrieval для Med_ai.
 
-Даёт три публичные функции, которых ждёт api_app.py:
+ДОСТУПНЫЕ ФУНКЦИИ:
   - bm25_search(index_dir: str, query: str, topk: int) -> List[dict]
   - embed_query_hf(query: str, model_name: str, device_hint: Optional[str], use_fp16: bool) -> List[float]
-  - retrieve_hybrid(query: str, k: int, ..., per_doc_limit: int) -> List[dict]
+  - retrieve_hybrid(query: str, k: int, ..., per_doc_limit: int, reranker_enabled: bool=False, rerank_top_k: int=50) -> List[dict]
 
 Особенности:
 - BM25 на Pyserini (Lucene). Если рядом с индексом есть meta-json (index/bm25_json/*.json),
-  берём оттуда doc_id/page/text. Иначе пытаемся распарсить raw из Lucene или docid.
+  берём оттуда doc_id/page/text. Иначе пытаемся распарсить raw/contents из Lucene или docid.
 - Qdrant: лёгкий клиент + query_points().
 - RRF-фьюжн списков (dense+bm25).
-- Максимум совместимости с уже созданными индексами и пайплайном.
+- Опциональный переранкер: косинусная близость между эмбеддингом запроса и текста кандидата
+  через тот же HF-эмбеддер (без дополнительных зависимостей).
 """
 
 from __future__ import annotations
@@ -20,6 +21,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import hashlib
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -43,8 +45,8 @@ from transformers import AutoTokenizer, AutoModel
 
 # -------------------- Константы --------------------
 
-_TEXT_SNIPPET_LIMIT = 3500  # ограничим текст фрагментов
-_PER_DOC_LIMIT_DEFAULT = 2  # по умолчанию не брать слишком много чанков из одного дока
+_TEXT_SNIPPET_LIMIT = 3500   # ограничим текст фрагментов
+_PER_DOC_LIMIT_DEFAULT = 2   # по умолчанию не брать слишком много чанков из одного дока
 
 
 # -------------------- Вспомогательные --------------------
@@ -80,7 +82,7 @@ def _load_bm25_meta(index_dir: str) -> Dict[str, Dict[str, Any]]:
     for p in meta_dir.glob("*.json"):
         try:
             j = json.loads(p.read_text(encoding="utf-8"))
-            # ожидаем поля: id, doc_id, page, text
+            # ожидаем поля: id, doc_id, page, text (или contents)
             doc_id = j.get("doc_id") or "unknown"
             page = int(j.get("page") or 1)
             text = j.get("text") or j.get("contents") or ""
@@ -91,43 +93,42 @@ def _load_bm25_meta(index_dir: str) -> Dict[str, Dict[str, Any]]:
     return mapping
 
 
-def _hit_to_record(s, hit, meta_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+def _hit_to_record(searcher, hit, meta_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     """
     Преобразуем Lucene hit в {doc_id,page,text}, максимально гибко:
     1) meta_map[id] (если есть рядом bm25_json)
     2) raw JSON из Lucene документа (если индексировали JSON и сохраняли raw)
-    3) попытка распарсить из docid паттерны вида 'КР123#p5' или 'КР123_p5' и т.п.
+    3) contents() как текст
+    4) попытка распарсить из docid паттерны вида 'КР123#p5' или 'КР123_p5' и т.п.
     """
     rec: Dict[str, Any] = {"doc_id": "unknown", "page": 1, "text": ""}
 
-    # id строки у Pyserini
-    id_str = getattr(hit, "docid", None) or getattr(hit, "docid", None)
+    id_str = getattr(hit, "docid", None)
     if id_str and id_str in meta_map:
-        return {
-            "doc_id": meta_map[id_str]["doc_id"],
-            "page": int(meta_map[id_str]["page"] or 1),
-            "text": (meta_map[id_str]["text"] or "")[:_TEXT_SNIPPET_LIMIT],
-        }
+        m = meta_map[id_str]
+        return {"doc_id": m["doc_id"], "page": int(m["page"] or 1), "text": (m["text"] or "")[:_TEXT_SNIPPET_LIMIT]}
 
-    # Попытка прочитать raw
+    # Попытка прочитать raw / contents
     try:
-        doc = s.doc(hit.docid)
-        raw = doc.raw() if callable(getattr(doc, "raw", None)) else getattr(doc, "raw", "")
+        doc = searcher.doc(hit.docid)
+        raw = doc.raw() if callable(getattr(doc, "raw", None)) else None
         if raw:
             try:
                 j = json.loads(raw)
                 text = j.get("text") or j.get("contents") or ""
                 doc_id = j.get("doc_id") or j.get("id") or "unknown"
                 page = int(j.get("page") or 1)
-                rec = {"doc_id": doc_id, "page": page, "text": text[:_TEXT_SNIPPET_LIMIT]}
-                return rec
+                return {"doc_id": str(doc_id), "page": page, "text": str(text)[:_TEXT_SNIPPET_LIMIT]}
             except Exception:
-                # если raw не JSON — просто сохраним как текст
-                rec["text"] = str(raw)[:_TEXT_SNIPPET_LIMIT]
+                # если raw не JSON — упадём в contents()
+                pass
+        contents = doc.contents() if callable(getattr(doc, "contents", None)) else None
+        if contents:
+            rec["text"] = str(contents)[:_TEXT_SNIPPET_LIMIT]
     except Exception:
         pass
 
-    # Фоллбек: пытаемся вытащить doc_id/page из самого docid
+    # Фоллбек: из docid достанем doc_id/page
     if id_str:
         m = re.match(r"(.+?)(?:[#_:/-])p?(\d+)$", str(id_str))
         if m:
@@ -142,36 +143,7 @@ def _hit_to_record(s, hit, meta_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any
     return rec
 
 
-# -------------------- Публичные функции --------------------
-
-def bm25_search(index_dir: str, query: str, topk: int = 50) -> List[Dict[str, Any]]:
-    """
-    Поиск по Lucene (Pyserini). Возвращает список словарей:
-    { "doc_id": str, "page": int, "text": str }
-    """
-    if not query:
-        return []
-    try:
-        s = _get_lucene_searcher(index_dir)
-    except Exception as e:
-        print(f"⚠️ BM25 недоступен: {e}")
-        return []
-
-    meta = _load_bm25_meta(index_dir)
-    try:
-        hits = s.search(query, topk)
-    except Exception as e:
-        print(f"⚠️ BM25 search error: {e}")
-        return []
-
-    out: List[Dict[str, Any]] = []
-    for h in hits:
-        rec = _hit_to_record(s, h, meta)
-        out.append(rec)
-    return out
-
-
-# ---- Embedding (HF Transformers, mean pooling) ----
+# -------------------- Embeddings (HF Transformers) --------------------
 
 @lru_cache(maxsize=2)
 def _load_hf(model_name: str) -> Tuple[AutoTokenizer, AutoModel]:
@@ -188,6 +160,16 @@ def _mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) ->
     return summed / counts
 
 
+def _select_device(device_hint: Optional[str]) -> str:
+    if device_hint:
+        dh = device_hint.strip().lower()
+        if dh in {"cuda", "gpu"} and torch.cuda.is_available():
+            return "cuda"
+        if dh in {"cpu"}:
+            return "cpu"
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
 def embed_query_hf(
     query: str,
     model_name: str = "BAAI/bge-m3",
@@ -202,7 +184,7 @@ def embed_query_hf(
         return []
 
     tok, mdl = _load_hf(model_name)
-    device = device_hint or ("cuda" if torch.cuda.is_available() else "cpu")
+    device = _select_device(device_hint)
     mdl = mdl.to(device)
     if use_fp16 and device == "cuda":
         mdl = mdl.half()
@@ -227,13 +209,50 @@ def embed_query_hf(
         return emb
 
 
-# ---- Qdrant ----
+def _embed_texts(
+    texts: List[str],
+    model_name: str = "BAAI/bge-m3",
+    device_hint: Optional[str] = None,
+    use_fp16: bool = False,
+    batch_size: int = 16,
+) -> torch.Tensor:
+    """
+    Батчевый эмбеддинг списка текстов. Возвращает тензор (N, D) на CPU.
+    """
+    tok, mdl = _load_hf(model_name)
+    device = _select_device(device_hint)
+    mdl = mdl.to(device)
+    if use_fp16 and device == "cuda":
+        mdl = mdl.half()
+
+    all_vecs: List[torch.Tensor] = []
+    mdl.eval()
+    with torch.no_grad():
+        for i in range(0, len(texts), batch_size):
+            chunk = texts[i:i + batch_size]
+            enc = tok(
+                chunk,
+                max_length=512,
+                padding=True,
+                truncation=True,
+                return_tensors="pt",
+            ).to(device)
+            out = mdl(**enc)
+            if hasattr(out, "last_hidden_state"):
+                vec = _mean_pool(out.last_hidden_state, enc["attention_mask"])
+            else:
+                vec = _mean_pool(out[0], enc["attention_mask"])
+            vec = torch.nn.functional.normalize(vec, p=2, dim=1)
+            all_vecs.append(vec.float().cpu())
+    return torch.cat(all_vecs, dim=0) if all_vecs else torch.empty(0)
+
+
+# -------------------- Qdrant --------------------
 
 @lru_cache(maxsize=2)
 def _qdrant_client(url: str):
     if QdrantClient is None:
         raise RuntimeError("qdrant-client не установлен.")
-    # В Dev у нас REST, поэтому PREFER_GRPC=false
     prefer_grpc = (os.getenv("QDRANT__PREFER_GRPC", "false").lower() == "true")
     return QdrantClient(url=url, prefer_grpc=prefer_grpc)
 
@@ -268,9 +287,38 @@ def _load_pages_text(pages_dir: Path, doc_id: str, a: int, b: int) -> str:
                     t = j.get("text") or ""
                     if t:
                         out.append(str(t))
-        return "\n\n".join(out)
+        return "\n\n".join(out)[:_TEXT_SNIPPET_LIMIT]
     except Exception:
         return ""
+
+
+# -------------------- Публичные функции --------------------
+
+def bm25_search(index_dir: str, query: str, topk: int = 50) -> List[Dict[str, Any]]:
+    """
+    Поиск по Lucene (Pyserini). Возвращает список словарей:
+    { "doc_id": str, "page": int, "text": str }
+    """
+    if not query:
+        return []
+    try:
+        s = _get_lucene_searcher(index_dir)
+    except Exception as e:
+        print(f"⚠️ BM25 недоступен: {e}")
+        return []
+
+    meta = _load_bm25_meta(index_dir)
+    try:
+        hits = s.search(query, topk)
+    except Exception as e:
+        print(f"⚠️ BM25 search error: {e}")
+        return []
+
+    out: List[Dict[str, Any]] = []
+    for h in hits:
+        rec = _hit_to_record(s, h, meta)
+        out.append(rec)
+    return out
 
 
 def retrieve_hybrid(
@@ -285,9 +333,13 @@ def retrieve_hybrid(
     hf_device: Optional[str] = None,
     hf_fp16: bool = False,
     per_doc_limit: int = _PER_DOC_LIMIT_DEFAULT,
+    # новые флаги — для совместимости с runtime
+    reranker_enabled: bool = False,
+    rerank_top_k: int = 50,
 ) -> List[Dict[str, Any]]:
     """
     Гибридный поиск: Qdrant (dense) + BM25 (sparse) + RRF, возвращает до k фрагментов.
+    Если включён pereranок — досортируем кандидатов косинусом к запросу (на том же эмбеддере).
     """
     results: List[Dict[str, Any]] = []
     if k <= 0 or not query:
@@ -333,24 +385,19 @@ def retrieve_hybrid(
     # ---------- 4) Сбор контента ----------
     pages_dir_p = Path(pages_dir)
     used_per_doc: Dict[str, int] = {}
+    candidates: List[Dict[str, Any]] = []
 
     for did in top_docids:
-        if len(results) >= k:
-            break
-
         # BM25-чанк (узкий, обычно конкретная страница)
         if did in bm_first and used_per_doc.get(did, 0) < per_doc_limit:
             h = bm_first[did]
-            rec = {
+            candidates.append({
                 "doc_id": did,
                 "page_start": int(h.get("page") or 1),
                 "page_end": int(h.get("page") or 1),
                 "text": (h.get("text") or "")[:_TEXT_SNIPPET_LIMIT],
-            }
-            results.append(rec)
+            })
             used_per_doc[did] = used_per_doc.get(did, 0) + 1
-            if len(results) >= k:
-                break
 
         # Qdrant «окно страниц»
         if did in qd_payload_first and used_per_doc.get(did, 0) < per_doc_limit:
@@ -359,7 +406,7 @@ def retrieve_hybrid(
             b = int(pl.get("page_end", a) or a)
             text = _load_pages_text(pages_dir_p, did, a, b) or _load_pages_text(pages_dir_p, did, 1, 1)
             if text:
-                results.append({
+                candidates.append({
                     "doc_id": did,
                     "page_start": a,
                     "page_end": b,
@@ -367,5 +414,26 @@ def retrieve_hybrid(
                 })
                 used_per_doc[did] = used_per_doc.get(did, 0) + 1
 
-    return results
+    # ---------- 5) Опциональный переранкер (косинус через тот же эмбеддер) ----------
+    if reranker_enabled and candidates:
+        try:
+            q_vec = torch.tensor(embed_query_hf(query, model_name=hf_model, device_hint=hf_device, use_fp16=hf_fp16)).unsqueeze(0)
+            t_vecs = _embed_texts([c["text"] for c in candidates[:max(rerank_top_k, len(candidates))]],
+                                  model_name=hf_model, device_hint=hf_device, use_fp16=hf_fp16)
+            if t_vecs.numel() > 0:
+                # нормализация уже есть, так что просто cos = q @ t^T
+                sims = torch.matmul(torch.nn.functional.normalize(q_vec, p=2, dim=1),
+                                    torch.nn.functional.normalize(t_vecs, p=2, dim=1).T).squeeze(0)
+                # прицепим и отсортируем
+                for i, s in enumerate(sims.tolist()):
+                    candidates[i]["_rerank_score"] = float(s)
+                candidates.sort(key=lambda x: x.get("_rerank_score", 0.0), reverse=True)
+        except Exception as e:
+            print("⚠️ Reranker (cosine) error:", e)
 
+    # ---------- 6) Вернуть top-k ----------
+    out: List[Dict[str, Any]] = []
+    for it in candidates[:k]:
+        it.pop("_rerank_score", None)
+        out.append(it)
+    return out

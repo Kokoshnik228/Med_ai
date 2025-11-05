@@ -29,6 +29,7 @@ services:
       APP_PORT: "8000"                   # внутри контейнера
       LLM_BASE_URL: "http://host.docker.internal:11434"
       EASYOCR_DIR: "/root/.EasyOCR"
+      EASYOCR_ALLOW_DOWNLOADS: "1"
       # GPU-переменные для nvidia-container-toolkit:
       NVIDIA_VISIBLE_DEVICES: "all"
       NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
