@@ -3,17 +3,18 @@
 RAW (PDF/DOCX/TXT) -> data/*.pages.jsonl + data/manifest.json
 
 Особенности:
-- Поддержка PDF, DOCX, TXT (рекурсивно по --input-dir).
-- DOCX/TXT нарезаются на «псевдо-страницы» фиксированной длины (по умолчанию 1800 символов),
-  чтобы downstream (BM25/Qdrant/цитаты) был совместим с PDF-страницами.
-- OCR backends: tesseract (CPU) / easyocr (GPU при наличии CUDA).
-- Режимы OCR: auto (только если мало текста), always (всегда), never (выкл).
-- Предобработка изображений (OpenCV): CLAHE, бинаризация, шумоподавление.
-- Параллельная обработка файлов.
+- Рекурсивный обход --input-dir (по умолчанию raw_docs/).
+- PDF: извлечение текста, при необходимости OCR (tesseract или easyocr).
+- DOCX/TXT: нарезка на «псевдо-страницы» фиксированной длины (по умолчанию 1800 символов),
+  чтобы down-stream (BM25/Qdrant/цитаты) работал одинаково с PDF.
+- Инкрементальность: обрабатываем только новые/изменённые файлы (по SHA1), если НЕ указан --force.
+- EasyOCR: тёплый старт для скачивания моделей один раз; в воркерах скачивание отключено
+  (исключает гонку '.../model/temp.zip').
 
-Зависимости внутри контейнера app:
+Зависимости (в контейнере app):
   pip install chardet pymupdf pillow python-docx
-  # для GPU-OCR (необязательно):
+  # для OCR (опционально):
+  apt-get install -y tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus
   pip install easyocr opencv-python-headless
 """
 
@@ -48,7 +49,7 @@ try:
     from PIL import Image
     TESS_AVAILABLE = True
 except Exception:
-    from PIL import Image  # Pillow нам всё равно нужно
+    from PIL import Image  # Pillow всё равно требуется
     TESS_AVAILABLE = False
 
 try:
@@ -57,7 +58,7 @@ try:
 except Exception:
     EASY_AVAILABLE = False
 
-# OpenCV (для предобработки)
+# OpenCV (предобработка для OCR)
 try:
     import cv2
     import numpy as np
@@ -123,7 +124,7 @@ def split_text_to_pages(full_text: str, page_size_chars: int = 1800) -> List[Dic
     parts: List[str] = []
     buf = []
     cur_len = 0
-    # грубо по абзацам/точкам/точкам с запятыми
+    # грубо по абзацам/предложениям
     tokens = re.split(r"(\n\n|[.!?]\s+)", text)
     for t in tokens:
         if t is None:
@@ -191,6 +192,7 @@ def ingest_pdf(
     verbose: bool,
     easy_reader=None
 ) -> List[Dict[str, Any]]:
+
     pages: List[Dict[str, Any]] = []
     try:
         doc = fitz.open(pdf_path)
@@ -280,11 +282,18 @@ def choose_ocr_backend(requested: str) -> str:
     return "none"  # OCR недоступен
 
 
+def _easyocr_models_ready(model_dir: Path) -> bool:
+    try:
+        mdir = model_dir / "model"
+        return mdir.exists() and any(mdir.iterdir())
+    except Exception:
+        return False
+
+
 def process_one_file(
     f: Path,
     out_dir: Path,
     *,
-    force: bool,
     min_chars: int,
     ocr_mode: str,
     ocr_backend_eff: str,  # уже выбранный эффективный backend
@@ -292,6 +301,7 @@ def process_one_file(
     dpi: int,
     verbose: bool,
     page_size_chars: int,
+    easyocr_dir: Path,
 ) -> Dict[str, Any]:
     """Процессинг одного файла (без доступа к manifest). Возвращает entry + путь pages."""
     sha = file_sha1(f)
@@ -299,7 +309,7 @@ def process_one_file(
     doc_id = stem  # уникализацию по doc_id решаем на верхнем уровне, если потребуется
     out_pages = out_dir / f"{doc_id}.pages.jsonl"
 
-    # OCR init (easyocr локально в процессе)
+    # OCR init (easyocr локально в процессе; скачивания не допускаем)
     easy_reader = None
     if ocr_mode != "never" and ocr_backend_eff == "easyocr":
         use_gpu = False
@@ -308,7 +318,13 @@ def process_one_file(
             use_gpu = torch.cuda.is_available()
         except Exception:
             pass
-        easy_reader = easyocr.Reader(['ru', 'en'], gpu=use_gpu, download_enabled=True)
+        # скачивание запрещено в воркерах
+        easy_reader = easyocr.Reader(
+            ['ru', 'en'],
+            gpu=use_gpu,
+            model_storage_directory=str(easyocr_dir),
+            download_enabled=False
+        )
 
     # Парсинг
     ext = f.suffix.lower()
@@ -375,7 +391,7 @@ def main():
 
     # Рекурсивно собираем файлы
     allowed = {".pdf", ".docx", ".txt"}
-    files = []
+    files: List[Path] = []
     for p in in_dir.rglob("*"):
         if not p.is_file():
             continue
@@ -406,7 +422,7 @@ def main():
     by_source: Dict[str, Dict[str, Any]] = {d.get("source_path"): d for d in docs if isinstance(d, dict)}
     existing_ids = {d.get("doc_id") for d in docs if isinstance(d, dict)}
 
-    # План работ: перепарсить только изменённые/новые или --force
+    # План работ: перепарсить только новые/изменённые или --force
     plan: List[Path] = []
     for f in files:
         sha = file_sha1(f)
@@ -414,7 +430,11 @@ def main():
         if args.force or not prev or prev.get("sha1") != sha:
             plan.append(f)
         elif args.verbose:
-            print(f"→ Без изменений: {f.relative_to(in_dir)}")
+            try:
+                rel = f.relative_to(in_dir)
+            except Exception:
+                rel = f
+            print(f"→ Без изменений: {rel}")
 
     if not plan:
         print("Нет изменений — ничего делать не нужно.")
@@ -422,8 +442,29 @@ def main():
 
     # Эффективный OCR backend с учётом установленного
     ocr_backend_eff = choose_ocr_backend(args.ocr_backend)
-    if args.verbose and args.ocr_mode != "never":
-        print(f"[INFO] OCR backend: requested={args.ocr_backend}, effective={ocr_backend_eff}")
+    easyocr_dir = Path(os.getenv("EASYOCR_DIR", str(Path.home() / ".EasyOCR"))).expanduser()
+    ensure_dir(easyocr_dir / "model")
+
+    # Если нужен easyocr и моделей ещё нет – делаем «тёплый старт» (однопроцессно)
+    need_easy_warmup = (
+        args.ocr_mode != "never"
+        and ocr_backend_eff == "easyocr"
+        and not _easyocr_models_ready(easyocr_dir)
+    )
+    if need_easy_warmup:
+        print("⏳ EasyOCR warmup: загрузка моделей (один раз)...")
+        use_gpu = False
+        try:
+            import torch
+            use_gpu = torch.cuda.is_available()
+        except Exception:
+            pass
+        # ВНИМАНИЕ: здесь download_enabled=True (разрешаем скачивание ровно один раз)
+        easyocr.Reader(['ru','en'], gpu=use_gpu,
+                       model_storage_directory=str(easyocr_dir),
+                       download_enabled=True)
+        # первый прогон — без параллелизма (исключаем гонки)
+        args.workers = 1
 
     # Параллелизм по файлам
     workers = args.workers or max(1, os.cpu_count() or 1)
@@ -432,9 +473,15 @@ def main():
     if workers <= 1 or len(plan) == 1:
         for f in plan:
             r = process_one_file(
-                f, out_dir, force=args.force, min_chars=args.min_chars,
-                ocr_mode=args.ocr_mode, ocr_backend_eff=ocr_backend_eff, ocr_lang=args.ocr_lang,
-                dpi=args.dpi, verbose=args.verbose, page_size_chars=args.page_size_chars
+                f, out_dir,
+                min_chars=args.min_chars,
+                ocr_mode=args.ocr_mode,
+                ocr_backend_eff=ocr_backend_eff,
+                ocr_lang=args.ocr_lang,
+                dpi=args.dpi,
+                verbose=args.verbose,
+                page_size_chars=args.page_size_chars,
+                easyocr_dir=easyocr_dir
             )
             results.append(r)
     else:
@@ -442,9 +489,14 @@ def main():
             futs = {
                 ex.submit(
                     process_one_file, f, out_dir,
-                    force=args.force, min_chars=args.min_chars,
-                    ocr_mode=args.ocr_mode, ocr_backend_eff=ocr_backend_eff, ocr_lang=args.ocr_lang,
-                    dpi=args.dpi, verbose=args.verbose, page_size_chars=args.page_size_chars
+                    min_chars=args.min_chars,
+                    ocr_mode=args.ocr_mode,
+                    ocr_backend_eff=ocr_backend_eff,
+                    ocr_lang=args.ocr_lang,
+                    dpi=args.dpi,
+                    verbose=args.verbose,
+                    page_size_chars=args.page_size_chars,
+                    easyocr_dir=easyocr_dir
                 ): f for f in plan
             }
             for fut in as_completed(futs):
@@ -467,7 +519,11 @@ def main():
             # переименуем файл jsonl
             op = Path(r["out_pages"])
             op_renamed = op.with_name(f"{new_id}.pages.jsonl")
-            op.rename(op_renamed)
+            try:
+                op.rename(op_renamed)
+            except FileNotFoundError:
+                # на всякий случай, если уже переименовали/не создался
+                pass
             r["doc_id"] = new_id
             r["out_pages"] = str(op_renamed)
             doc_id = new_id
@@ -481,12 +537,12 @@ def main():
             "lang": "ru",
             "sha1": r["sha1"],
             "ocr": (args.ocr_mode != "never" and ocr_backend_eff != "none"),
-            "ocr_mode": args.ocr_mode,
+            "ocr_mode": r["ocr_mode"],
             "ocr_backend": r["ocr_backend"],
             "ocr_lang": r["ocr_lang"],
             "dpi": r["dpi"],
             "min_chars": r["min_chars"],
-            "empty_pages": r["empty_pages"]
+            "empty_pages": r["empty_pages"],
         }
         if prev:
             prev.update(entry)

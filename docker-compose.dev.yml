@@ -10,19 +10,13 @@ services:
     volumes:
       - qdrant_storage_dev:/qdrant/storage
     healthcheck:
-      # у qdrant есть /readyz; увеличили терпимость и стартовый период
-      test: ["CMD", "curl", "-fsS", "http://localhost:6333/readyz"]
+      test: ["CMD", "curl", "-f", "http://localhost:6333/readyz"]
       interval: 5s
       timeout: 3s
-      retries: 40
-      start_period: 20s
+      retries: 20
 
   app:
-    build:
-      context: .
-      args:
-        # CPU по умолчанию. Для GPU собери: TORCH_VARIANT=cu121
-        TORCH_VARIANT: "cpu"
+    build: .
     container_name: medai_app_dev
     restart: unless-stopped
     depends_on:
@@ -34,16 +28,22 @@ services:
 
     environment:
       APP_HOST: "0.0.0.0"
-      APP_PORT: "8000"
+      APP_PORT: "8000"                   # внутри контейнера
       LLM_BASE_URL: "http://host.docker.internal:11434"
-      EASY_OCR_HOME: "/root/.EasyOCR"   # путь должен совпадать с Dockerfile
+      EASYOCR_DIR: "/root/.EasyOCR"
+      # GPU-переменные для nvidia-container-toolkit:
+      NVIDIA_VISIBLE_DEVICES: "all"
+      NVIDIA_DRIVER_CAPABILITIES: "compute,utility"
 
     ports:
-      - "7050:8000"                # host:7050 -> container:8000
+      - "7050:8000"                      # host:7050 -> container:8000
 
     volumes:
       - ./:/app
-      - easyocr_cache:/root/.EasyOCR   # кеш EasyOCR теперь объявлен и не «undefined»
+      - easyocr_cache:/root/.EasyOCR
+
+    # Доступ к GPU (docker compose v2 + nvidia-container-toolkit на хосте)
+    gpus: "all"
 
     command: ["bash", "start.sh"]
 
