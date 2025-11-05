@@ -26,6 +26,7 @@ services:
       - "7050:8000"
     volumes:
       - ./:/app
+      - easyocr_cache:/root/.EasyOCR
     command: ["bash", "start.sh"]
     extra_hosts:
       - "host.docker.internal:host-gateway"

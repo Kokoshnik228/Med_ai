@@ -906,23 +906,22 @@ def ui_root():
 # ================================
 index_status = {"state": "idle", "message": "Ожидание"}
 
+
 @app.get("/reindex/status")
 def reindex_status():
+    # всегда объект, чтобы фронт не падал
     return index_status
 
-@app.post("/reindex")
-def reindex_ep(full: bool = False):
+def run_reindex(*, full: bool = False):
+    import os as _os
+    import time as _time
     import socket as _socket
     import subprocess as _subprocess
+    from pathlib import Path
 
-    def _bm25_ready(index_dir: str) -> bool:
-        p = Path(index_dir)
-        if not p.exists():
-            return False
-        has_segments = any(p.glob("segments_*"))
-        has_si = any(p.glob("*.si"))
-        return has_segments and has_si
+    global index_status
 
+    # --- helpers ---
     def _nz(val, default):
         s = (val or "").strip() if isinstance(val, str) else val
         return s if s not in (None, "", "None") else default
@@ -945,30 +944,52 @@ def reindex_ep(full: bool = False):
             return "http://localhost:7779"
         return url
 
-def run_reindex():
-    global index_status
-    try:
-        index_status.update({"state": "running", "message": "📘 Индексация запущена..."})
-        print("⚙️ Запуск индексации документов...")
+    # штамп свежести BM25
+    STAMP_BM25 = Path("index/.bm25_last_build")
+    def _latest_pages_mtime() -> float:
+        pages = list(Path("data").glob("*.pages.jsonl"))
+        return max((p.stat().st_mtime for p in pages), default=0.0)
 
-        # --- окружение для подпроцессов ---
-        env = os.environ.copy()
+    def _bm25_needs_rebuild() -> bool:
+        last_pages = _latest_pages_mtime()
+        if last_pages == 0.0:
+            return False
+        if not STAMP_BM25.exists():
+            return True
+        return last_pages > STAMP_BM25.stat().st_mtime
+
+    def _touch_bm25_stamp():
+        STAMP_BM25.parent.mkdir(parents=True, exist_ok=True)
+        STAMP_BM25.write_text(str(_time.time()), encoding="utf-8")
+
+    try:
+        env = _os.environ.copy()
         env["QDRANT__PREFER_GRPC"] = "false"
 
-        # --- резолв параметров ---
-        qdrant_url = _normalize_qdrant_url(_nz(_resolve("QDRANT_URL", "http://localhost:7779"), "http://localhost:7779"))
-        collection = _nz(_resolve("QDRANT_COLLECTION", "med_kb_v3"), "med_kb_v3")
-        emb_backend = _nz(os.getenv("EMB_BACKEND") or cfg("embedding", "backend", default="hf"), "hf")
-        # поддержим оба ключа (hf_model|model) + ENV
+        # --- Шаг 1: Ingest (всегда) ---
+        index_status.update({"state": "running", "message": "📄 Шаг 1: парсинг RAW → JSONL (инкрементально)..."})
+        print("▶️ ingest_from_raw.py ...")
+        cmd_ingest = ["python", "ingest_from_raw.py", "--input-dir", "raw_docs", "--out-dir", "data"]
+        if full:
+            cmd_ingest.append("--force")
+        _subprocess.run(cmd_ingest, check=True, env=env)
+
+        # --- Резолв параметров для следующих шагов ---
+        qdrant_url = _normalize_qdrant_url(
+            _nz(_os.getenv("QDRANT_URL") or cfg("qdrant", "url", default="http://qdrant:6333"),
+                "http://localhost:7779")
+        )
+        collection = _nz(_os.getenv("QDRANT_COLLECTION") or cfg("qdrant", "collection", default="med_kb_v3"), "med_kb_v3")
+        emb_backend = _nz(_os.getenv("EMB_BACKEND") or cfg("embedding", "backend", default="hf"), "hf")
         hf_model = _nz(
-            os.getenv("HF_MODEL") or
+            _os.getenv("HF_MODEL") or
             cfg("embedding", "hf_model", default=cfg("embedding", "model", default="BAAI/bge-m3")),
             "BAAI/bge-m3"
         )
 
-        child_w       = _as_int(os.getenv("CHILD_W"),       cfg("chunking", "child_w",       default=200))
-        child_overlap = _as_int(os.getenv("CHILD_OVERLAP"), cfg("chunking", "child_overlap", default=35))
-        parent_w      = _as_int(os.getenv("PARENT_W"),      cfg("chunking", "parent_w",      default=800))
+        child_w       = _as_int(_os.getenv("CHILD_W"),       cfg("chunking", "child_w",       default=200))
+        child_overlap = _as_int(_os.getenv("CHILD_OVERLAP"), cfg("chunking", "child_overlap", default=35))
+        parent_w      = _as_int(_os.getenv("PARENT_W"),      cfg("chunking", "parent_w",      default=800))
 
         print(
             "🔧 RESOLVED → "
@@ -977,54 +998,8 @@ def run_reindex():
             f"child_w={child_w} child_overlap={child_overlap} parent_w={parent_w}"
         )
 
-        if not collection:
-            raise RuntimeError("QDRANT_COLLECTION пустой — укажи имя коллекции.")
-        if emb_backend not in ("hf", "ollama"):
-            raise RuntimeError(f"Неверный EMB_BACKEND: {emb_backend!r}")
-
-        # ---------------------------
-        # Шаг 1: INGEST (всегда)
-        # ---------------------------
-        index_status["message"] = "📄 Шаг 1: парсинг RAW → JSONL (инкрементальный)..."
-        print("▶️ ingest_from_raw.py ...")
-        cmd_ingest = [
-            "python", "ingest_from_raw.py",
-            "--input-dir", "raw_docs",
-            "--out-dir", "data",
-        ]
-        if full:
-            cmd_ingest.append("--force")   # полный прогон по запросу
-        _subprocess.run(cmd_ingest, check=True, env=env)
-
-        # ---------------------------
-        # Шаг 2: BM25 — только если появились новые pages.jsonl
-        # ---------------------------
-        from pathlib import Path
-        import time as _time
-
-        STAMP_BM25 = Path("index/.bm25_last_build")
-
-        def _latest_pages_mtime() -> float:
-            pages = list(Path("data").glob("*.pages.jsonl"))
-            return max((p.stat().st_mtime for p in pages), default=0.0)
-
-        def _bm25_needs_rebuild() -> bool:
-            last_pages = _latest_pages_mtime()
-            if last_pages == 0.0:
-                return False  # ещё нет страниц — нечего индексировать
-            if not STAMP_BM25.exists():
-                return True   # ещё ни разу не строили BM25
-            return last_pages > STAMP_BM25.stat().st_mtime
-
-        def _touch_bm25_stamp():
-            STAMP_BM25.parent.mkdir(parents=True, exist_ok=True)
-            STAMP_BM25.write_text(str(_time.time()), encoding="utf-8")
-
-        needs_bm25 = _bm25_needs_rebuild()
-        if not full and not needs_bm25:
-            index_status["message"] = "⏭️  Шаг 2 пропущен: новых страниц для BM25 нет"
-            print(index_status["message"])
-        else:
+        # --- Шаг 2: BM25 (только при необходимости или при full) ---
+        if full or _bm25_needs_rebuild():
             index_status["message"] = "📚 Шаг 2: построение/обновление BM25 индекса..."
             print("▶️ build_bm25.py ...")
             _subprocess.run(
@@ -1033,18 +1008,19 @@ def run_reindex():
                     "--pages-glob", "data/*.pages.jsonl",
                     "--out-json",   "index/bm25_json",
                     "--index-dir",  "index/bm25_idx",
-                    # если добавишь инкрементальный режим в build_bm25.py, раскомментируй:
+                    # если добавишь в build_bm25.py инкрементальный режим, сюда можно докинуть флаг:
                     # "--only-new",
                 ],
                 check=True, env=env
             )
             _touch_bm25_stamp()
+        else:
+            index_status["message"] = "⏭️  Шаг 2 пропущен: новых страниц для BM25 нет"
+            print(index_status["message"])
 
-        # ---------------------------
-        # Шаг 3: Dense → Qdrant (инкрементально)
-        # ---------------------------
+        # --- Шаг 3: Dense → Qdrant ---
         index_status["message"] = "🧠 Шаг 3: индексация в Qdrant (dense)..."
-        cmd = [
+        cmd_qdr = [
             "python", "chunk_and_index.py",
             "--pages-glob",    "data/*.pages.jsonl",
             "--collection",    collection,
@@ -1056,18 +1032,22 @@ def run_reindex():
             "--child-overlap", str(child_overlap),
             "--parent-w",      str(parent_w),
         ]
-        cmd.append("--recreate" if full else "--only-new")
-        cmd = [str(x) for x in cmd]
-        print("▶️ CMD:", " ".join(cmd))
-        _subprocess.run(cmd, check=True, env=env)
+        cmd_qdr.append("--recreate" if full else "--only-new")
+        print("▶️ CMD:", " ".join(cmd_qdr))
+        _subprocess.run(cmd_qdr, check=True, env=env)
 
         index_status.update({"state": "done", "message": "✅ Индексация завершена."})
         print("✅ Индексация завершена.")
 
     except _subprocess.CalledProcessError as e:
         index_status.update({"state": "error", "message": f"❌ Процесс упал: {e}"})
-        print(f"❌ Процесс упал: {e}")
+        print(index_status["message"])
     except Exception as e:
         index_status.update({"state": "error", "message": f"❌ Ошибка: {e}"})
-        print(f"❌ Ошибка при индексации: {e}")
+        print(index_status["message"])
 
+@app.post("/reindex")
+def reindex_ep(full: bool = False):
+    # Запускаем в фоне и ВСЕГДА возвращаем объект с message
+    threading.Thread(target=run_reindex, kwargs={"full": bool(full)}, daemon=True).start()
+    return {"status": "started", "message": "Индексация запущена", "full": bool(full)}

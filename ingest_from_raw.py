@@ -308,7 +308,7 @@ def process_one_file(
             use_gpu = torch.cuda.is_available()
         except Exception:
             pass
-        easy_reader = easyocr.Reader(['ru', 'en'], gpu=use_gpu)
+        easy_reader = easyocr.Reader(['ru', 'en'], gpu=use_gpu, download_enabled=True)
 
     # Парсинг
     ext = f.suffix.lower()
