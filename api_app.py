@@ -109,7 +109,7 @@ def load_config() -> Dict[str, Any]:
             "model": os.getenv("MODEL_ID", os.getenv("LLM_MODEL", "llama3.1:8b")),
             # ↓ параметры «как долго/много думает»
             "max_tokens": int(os.getenv("LLM_MAX_TOKENS", "2048")),
-            "timeout_s": int(os.getenv("LLM_TIMEOUT", "180")),
+            "timeout_s": int(os.getenv("LLM_TIMEOUT", "60")),
             "temperature": float(os.getenv("LLM_TEMPERATURE", "0.4")),
             "top_p": float(os.getenv("LLM_TOP_P", "0.95")),
             "num_ctx": int(os.getenv("LLM_NUM_CTX", "6144")),
@@ -565,7 +565,7 @@ def debug_config():
             "base_url": cfg_str("ollama", "base_url", default="http://host.docker.internal:11434"),
             "model": cfg_str("ollama", "model", default="llama3.1:8b"),
             "max_tokens": cfg_int("ollama", "max_tokens", default=2048),
-            "timeout_s": cfg_int("ollama", "timeout_s", default=180),
+            "timeout_s": cfg_int("ollama", "timeout_s", default=60),
             "temperature": cfg_float("ollama", "temperature", default=0.4),
             "top_p": cfg_float("ollama", "top_p", default=0.95),
             "num_ctx": cfg_int("ollama", "num_ctx", default=6144),
@@ -662,9 +662,7 @@ def analyze_ep(req: AnalyzeReq):
 
             # РЕРАНКЕР — берём из runtime_settings
             reranker_enabled = bool(cfg("reranker", "enabled", default=False)),
-            reranker_model   = cfg("reranker", "model",   default=os.getenv("RERANKER_MODEL", "BAAI/bge-reranker-v2-m3")),
-            reranker_topn    = int(cfg("reranker", "top_n", default=50)),
-            reranker_device  = cfg("reranker", "device", default="cpu"),
+         
 )
 
         t_r1 = time.perf_counter()
@@ -697,7 +695,7 @@ def analyze_ep(req: AnalyzeReq):
         num_ctx = min(num_ctx_cap, max(3072, total_est + 256))
 
         # ── параметры «как долго и как много думаем»
-        llm_timeout   = cfg_int("ollama", "timeout_s", default=180)
+        llm_timeout   = cfg_int("ollama", "timeout_s", default=60)
         llm_max_tok   = cfg_int("ollama", "max_tokens", default=2048)
         llm_temp      = cfg_float("ollama", "temperature", default=0.4)
         llm_top_p     = cfg_float("ollama", "top_p", default=0.95)
@@ -734,7 +732,7 @@ def analyze_ep(req: AnalyzeReq):
             user_small = user_t.format(case_text=req.case_text, ctx=ctx_small)
             total_est_small = _approx_tokens(system) + _approx_tokens(user_small)
             num_ctx_small = min(num_ctx_cap, max(3072, total_est_small + 128))
-            retry_tokens = min(180, llm_max_tok)
+            retry_tokens = min(60, llm_max_tok)
 
             resp2 = call_ollama_json(
                 req.ollama_url, req.model, system, user_small,

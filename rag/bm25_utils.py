@@ -44,9 +44,13 @@ from transformers import AutoTokenizer, AutoModel
 
 
 # -------------------- Константы --------------------
-
-_TEXT_SNIPPET_LIMIT = 3500   # ограничим текст фрагментов
-_PER_DOC_LIMIT_DEFAULT = 2   # по умолчанию не брать слишком много чанков из одного дока
+# Читаем лимиты из ENV (синхрон с runtime_settings.py),
+# с безопасными дефолтами.
+_TEXT_SNIPPET_LIMIT = int(
+    os.getenv("TEXT_SNIPPET_LIMIT")
+    or os.getenv("MEDAI_TEXT_SNIPPET_LIMIT", "3500")
+)
+_PER_DOC_LIMIT_DEFAULT = int(os.getenv("RETR_PER_DOC_LIMIT", "2"))
 
 
 # -------------------- Утилиты --------------------
@@ -261,6 +265,10 @@ def _qdrant_client(url: str):
 
 
 def _rrf_fusion(runs: List[List[str]], k: int = 60, c: int = 60) -> Dict[str, float]:
+    """
+    Reciprocal Rank Fusion.
+    На вход — списки doc_id (без повторов в своём списке), на выход — {doc_id: score}.
+    """
     scores: Dict[str, float] = {}
     for run in runs:
         for rank, did in enumerate(run[:k], start=1):
@@ -269,6 +277,9 @@ def _rrf_fusion(runs: List[List[str]], k: int = 60, c: int = 60) -> Dict[str, fl
 
 
 def _load_pages_text(pages_dir: Path, doc_id: str, a: int, b: int) -> str:
+    """
+    Собирает текст из data/{doc_id}.pages.jsonl по страницам a..b с лимитом длины.
+    """
     pj = pages_dir / f"{doc_id}.pages.jsonl"
     if not pj.exists():
         return ""
@@ -291,6 +302,10 @@ def _load_pages_text(pages_dir: Path, doc_id: str, a: int, b: int) -> str:
 # -------------------- Публичные функции --------------------
 
 def bm25_search(index_dir: str, query: str, topk: int = 50) -> List[Dict[str, Any]]:
+    """
+    Поиск по Lucene (Pyserini). Возвращает список словарей:
+    { "doc_id": str, "page": int, "text": str }
+    """
     if not query:
         return []
     try:
@@ -411,15 +426,26 @@ def retrieve_hybrid(
     # ---------- 5) Опциональный переранкер ----------
     if reranker_enabled and candidates:
         try:
-            q_vec = torch.tensor(embed_query_hf(query, model_name=hf_model, device_hint=hf_device, use_fp16=hf_fp16)).unsqueeze(0)
-            t_vecs = _embed_texts([c["text"] for c in candidates[:max(rerank_top_k, len(candidates))]],
-                                  model_name=hf_model, device_hint=hf_device, use_fp16=hf_fp16)
-            if t_vecs.numel() > 0:
-                sims = torch.matmul(torch.nn.functional.normalize(q_vec, p=2, dim=1),
-                                    torch.nn.functional.normalize(t_vecs, p=2, dim=1).T).squeeze(0)
-                for i, s in enumerate(sims.tolist()):
-                    candidates[i]["_rerank_score"] = float(s)
-                candidates.sort(key=lambda x: x.get("_rerank_score", 0.0), reverse=True)
+            n = min(rerank_top_k, len(candidates))
+            if n > 0:
+                q_vec = torch.tensor(
+                    embed_query_hf(query, model_name=hf_model, device_hint=hf_device, use_fp16=hf_fp16)
+                ).unsqueeze(0)
+                t_vecs = _embed_texts([c["text"] for c in candidates[:n]],
+                                      model_name=hf_model, device_hint=hf_device, use_fp16=hf_fp16)
+                if t_vecs.numel() > 0:
+                    qn = torch.nn.functional.normalize(q_vec, p=2, dim=1)
+                    tn = torch.nn.functional.normalize(t_vecs, p=2, dim=1)
+                    sims = torch.matmul(qn, tn.T).squeeze(0).tolist()
+
+                    # присвоим score только head-части
+                    for i, s in enumerate(sims):
+                        candidates[i]["_rerank_score"] = float(s)
+
+                    # отсортируем head и приклеим хвост без изменений
+                    head = sorted(candidates[:n], key=lambda x: x.get("_rerank_score", 0.0), reverse=True)
+                    tail = candidates[n:]
+                    candidates = head + tail
         except Exception as e:
             print("⚠️ Reranker (cosine) error:", e)
 

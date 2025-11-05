@@ -123,7 +123,7 @@ def call_ollama(ollama_url: str, model: str, prompt: str) -> dict:
         "options": {"temperature": 0.1, "num_ctx": 8192, "top_p": 0.9},
         "stream": False
     }
-    r = requests.post(url, json=payload, timeout=180)
+    r = requests.post(url, json=payload, timeout=60)
     r.raise_for_status()
     raw = (r.json() or {}).get("response", "").strip()
     try:
