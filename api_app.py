@@ -84,6 +84,8 @@ app.add_middleware(
 # Config
 # ================================
 ROOT = Path(__file__).resolve().parent
+os.chdir(ROOT)
+print(f"📂 CWD set to: {Path.cwd()}")
 CONF_DIR = ROOT / "config"
 DEFAULT_YAML = CONF_DIR / "default.yaml"
 LOCAL_YAML = CONF_DIR / "local.yaml"
@@ -1054,6 +1056,14 @@ def run_reindex(*, full: bool = False):
 
     global index_status
 
+    base = ROOT
+    raw_dir = str(base / "raw_docs")
+    data_dir = str(base / "data")
+    ingest_py = str(base / "ingest_from_raw.py")
+    build_bm25_py = str(base / "build_bm25.py")
+    chunk_and_index_py = str(base / "chunk_and_index.py")
+
+
     # --- helpers ---
     def _nz(val, default):
         s = (val or "").strip() if isinstance(val, str) else val
@@ -1102,10 +1112,17 @@ def run_reindex(*, full: bool = False):
         # --- Шаг 1: Ingest (всегда) ---
         index_status.update({"state": "running", "message": "📄 Шаг 1: парсинг RAW → JSONL (инкрементально)..."})
         print("▶️ ingest_from_raw.py ...")
-        cmd_ingest = ["python", "ingest_from_raw.py", "--input-dir", "raw_docs", "--out-dir", "data"]
-        if full:
+
+        cmd_ingest = ["python", ingest_py, "--input-dir", raw_dir, "--out-dir", data_dir]
+
+        # полный прогон по запросу ИЛИ при пустом манифесте
+        man = Path(data_dir) / "manifest.json"
+        first_run = not man.exists() or not json.loads(man.read_text(encoding="utf-8") or "{}").get("docs")
+        if full or first_run:
             cmd_ingest.append("--force")
+
         _subprocess.run(cmd_ingest, check=True, env=env)
+
 
         # --- Резолв параметров для следующих шагов ---
         qdrant_url = _normalize_qdrant_url(
