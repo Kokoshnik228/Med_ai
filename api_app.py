@@ -23,6 +23,14 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
+try:
+    # pydantic v2
+    from pydantic import field_validator  # type: ignore
+    _P_V2 = True
+except Exception:
+    # pydantic v1
+    from pydantic import validator as field_validator  # type: ignore
+    _P_V2 = False
 
 # ================================
 # .env загрузка (dev/prod)
@@ -34,27 +42,14 @@ from pathlib import Path
 # ---- load .env, затем загрузить runtime_settings, затем продавить значения из файла в env ----
 try:
     from dotenv import load_dotenv
+    env_mode = (os.getenv("APP_ENV") or "dev").strip().lower()
+    env_file = Path(".env.dev" if env_mode == "dev" else ".env.prod")
+    if env_file.exists():
+        load_dotenv(dotenv_path=env_file)
+        print(f"🔧 Loaded env: {env_file}")
+except Exception as e:
+    print(f"⚠️ dotenv load skipped: {e}")
 
-    _env_mode = (os.getenv("APP_ENV") or "dev").strip().lower()
-    _env_file = Path(".env.dev" if _env_mode == "dev" else ".env.prod")
-
-    if _env_file.exists():
-        load_dotenv(dotenv_path=_env_file)
-        print(f"🔧 Loaded env: {_env_file}")
-    else:
-        print(f"⚠️ Env file not found: {_env_file} (fallback to process env)")
-
-    # Импортируем настройки ПОСЛЕ загрузки .env
-    from config.runtime_settings import settings
-
-    # ФАЙЛ — ГЛАВНЫЙ источник: насильно пробрасываем значения из runtime в окружение
-    settings.apply_env(force=True)
-
-    # Для контроля — печать активных значений
-    settings.pretty_print()
-
-except Exception as _e:
-    print(f"⚠️ dotenv/runtime settings init skipped: {_e}")
 
 
 # Нормализация env
@@ -545,9 +540,33 @@ def call_ollama_json(
 class AnalyzeReq(BaseModel):
     case_text: str
     query: Optional[str] = None
-    k: int = Field(default_factory=lambda: cfg("retrieval", "k", default=8))
+    # k берём с UI, но если пусто/None — поставим дефолт из runtime_settings
+    k: Optional[int] = Field(default=None)
     model: str = Field(default_factory=lambda: cfg("ollama", "model", default="llama3.1:8b"))
-    ollama_url: Optional[str] = Field(default_factory=lambda: cfg("ollama", "base_url", default="http://host.docker.internal:11434"))
+    ollama_url: Optional[str] = Field(
+        default_factory=lambda: cfg("ollama", "base_url", default="http://host.docker.internal:11434")
+    )
+
+    if _P_V2:
+        # pydantic v2
+        @field_validator("k", mode="before")
+        def _coerce_k_v2(cls, v):
+            if v in (None, "", "null"):
+                return settings.RETR_TOP_K
+            try:
+                return int(v)
+            except Exception:
+                return settings.RETR_TOP_K
+    else:
+        # pydantic v1
+        @field_validator("k", pre=True)
+        def _coerce_k_v1(cls, v):
+            if v in (None, "", "null"):
+                return settings.RETR_TOP_K
+            try:
+                return int(v)
+            except Exception:
+                return settings.RETR_TOP_K
 
 # ================================
 # Helpers
@@ -632,6 +651,9 @@ def analyze_ep(req: AnalyzeReq):
         # Из тела запроса:
         diag_query = (getattr(req, "query", "") or "").strip()       # поле с диагнозом/кодом, если пришло
         user_input_text = (getattr(req, "case_text", "") or "").strip()  # свободный текст кейса
+
+        k = req.k if isinstance(req.k, int) and 0 <= req.k <= 20 else settings.RETR_TOP_K
+
 
         # Если диагноз не задан — построим запрос из текста кейса (fallback)
         if diag_query:
@@ -834,6 +856,7 @@ textarea{min-height:180px}
 .small{font-size:12px;color:#475467}
 .err{color:#b91c1c}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.help{font-size:12px;color:#667085;margin-top:4px}
 </style>
 <div class="wrap">
   <div class="card">
@@ -842,7 +865,7 @@ textarea{min-height:180px}
   </div>
   <div class="card">
     <label>Текст кейса</label>
-    <textarea id="caseText" placeholder="Вставьте кейс: жалобы, анамнез, диагноз, назначения..."></textarea>
+    <textarea id="case" placeholder="Вставьте кейс: жалобы, анамнез, диагноз, назначения..."></textarea>
     <div class="row">
       <div>
         <label>Запрос для поиска (необязательно)</label>
@@ -852,8 +875,10 @@ textarea{min-height:180px}
         <label>Модель / K</label>
         <div class="row" style="grid-template-columns:2fr 1fr;gap:8px">
           <select id="model"><option>llama3.1:8b</option><option>llama3.1:70b</option></select>
-          <input id="k" type="number" value="6" min="0" max="20">
+          <!-- value пустой: если оставить пустым — сервер возьмёт дефолт из runtime_settings -->
+          <input id="k" type="number" value="" min="0" max="20" placeholder="по умолч.">
         </div>
+        <div class="help">Оставьте K пустым — возьмётся значение из настроек сервера</div>
       </div>
     </div>
     <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
@@ -873,21 +898,42 @@ textarea{min-height:180px}
   </div>
 </div>
 <script>
-const API = window.location.origin; document.getElementById('api').textContent = API;
-const el=id=>document.getElementById(id); const show=(n,on)=>n.style.display=on?'':'none';
+const API = window.location.origin;
+document.getElementById('api').textContent = API;
+
+const el = id => document.getElementById(id);
+const show = (n,on) => n.style.display = on ? '' : 'none';
+
 function colorForScore(s){ if(typeof s!=='number') return ''; if(s>=85) return '#dcfce7'; if(s>=65) return '#fef9c3'; return '#fee2e2'; }
+
 function renderResult(r){
-  const sc=r.score??'—'; const sb=document.getElementById('score'); sb.textContent='оценка: '+sc; sb.style.background=colorForScore(sc);
-  const subs=el('subs'); subs.innerHTML=''; Object.entries(r.subscores||{}).forEach(([k,v])=>{
+  const sc = r.score ?? '—';
+  const sb = el('score');
+  sb.textContent = 'оценка: ' + sc;
+  sb.style.background = colorForScore(sc);
+
+  const subs = el('subs'); subs.innerHTML = '';
+  Object.entries(r.subscores||{}).forEach(([k,v])=>{
     const d=document.createElement('div'); d.className='card'; d.style.margin=0;
     d.innerHTML=`<div class="small">${labelMap[k] || k}</div><div style="font-weight:700">${v??'—'}</div>`;
     subs.appendChild(d);
   });
-  const crit=el('crit'); crit.innerHTML=''; (r.critical_errors||[]).forEach(x=>{ const li=document.createElement('li'); li.textContent=`${x.type}: ${x.explain}`; crit.appendChild(li); });
-  const recs=el('recs'); recs.innerHTML=''; (r.recommendations||[]).forEach(x=>{ const li=document.createElement('li'); li.textContent=`${x.what_to_change} — ${x.rationale}`; recs.appendChild(li); });
-  const cits=el('cits'); cits.innerHTML=''; (r.citations||[]).forEach(x=>{ const li=document.createElement('li'); li.textContent=String(x); cits.appendChild(li); });
-  el('raw').textContent=JSON.stringify(r,null,2);
+
+  const crit=el('crit'); crit.innerHTML=''; (r.critical_errors||[]).forEach(x=>{
+    const li=document.createElement('li'); li.textContent=`${x.type}: ${x.explain}`; crit.appendChild(li);
+  });
+
+  const recs=el('recs'); recs.innerHTML=''; (r.recommendations||[]).forEach(x=>{
+    const li=document.createElement('li'); li.textContent=`${x.what_to_change} — ${x.rationale}`; recs.appendChild(li);
+  });
+
+  const cits=el('cits'); cits.innerHTML=''; (r.citations||[]).forEach(x=>{
+    const li=document.createElement('li'); li.textContent=String(x); cits.appendChild(li);
+  });
+
+  el('raw').textContent = JSON.stringify(r,null,2);
 }
+
 const labelMap = {
   "diagnosis": "Диагноз",
   "diagnosis_match": "Соответствие диагнозу",
@@ -900,16 +946,45 @@ const labelMap = {
   "monitoring": "Мониторинг",
   "evidence": "Доказательность"
 };
-async function run(){ el('error').textContent=''; show(el('busy'),true); el('run').disabled=true;
+
+async function run(){
+  el('error').textContent = '';
+  show(el('busy'), true);
+  el('run').disabled = true;
+
   try{
-    const body={ case_text: el('caseText').value||'', query: el('query').value||null, k: parseInt(el('k').value||'6',10), model: el('model').value||'llama3.1:8b' };
-    const res=await fetch(API+'/analyze',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
-    const txt=await res.text(); let data; try{ data=JSON.parse(txt); }catch(e){ throw new Error('Не удалось разобрать JSON ответа: '+txt.slice(0,200)); }
+    const body = {
+      case_text: (el('case').value || '').trim(),
+      query:     (el('query').value || '').trim() || null,
+      model:     el('model').value || 'llama3.1:8b'
+    };
+
+    // k: отправляем только если введено число
+    const kRaw = (el('k').value || '').trim();
+    if (kRaw !== '') {
+      const kParsed = parseInt(kRaw, 10);
+      if (Number.isFinite(kParsed)) body.k = kParsed;
+    }
+
+    const res = await fetch(API + '/analyze', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(body)
+    });
+
+    const txt = await res.text();
+    let data; try{ data = JSON.parse(txt); }catch(e){
+      throw new Error('Не удалось разобрать JSON ответа: ' + txt.slice(0,200));
+    }
     renderResult(data.result || data);
-  }catch(e){ el('error').textContent='Ошибка: '+(e?.message||e); }
-  finally{ show(el('busy'),false); el('run').disabled=false; }
+  }catch(e){
+    el('error').textContent = 'Ошибка: ' + (e?.message || e);
+  }finally{
+    show(el('busy'), false);
+    el('run').disabled = false;
+  }
 }
-el('run').onclick=run;
+el('run').onclick = run;
 
 el('reindex').onclick = async () => {
   show(el('busy'), true);
@@ -946,6 +1021,7 @@ setInterval(checkReindexStatus, 3000);
 </script>
 """
 
+
 @app.get("/", response_class=HTMLResponse)
 def ui_root():
     return HTMLResponse(UI_HTML)
@@ -955,6 +1031,14 @@ def ui_root():
 # ================================
 index_status = {"state": "idle", "message": "Ожидание"}
 
+@app.get("/runtime/defaults")
+def runtime_defaults():
+    return {
+        "RETR_TOP_K": settings.RETR_TOP_K,
+        "RERANKER_ENABLED": settings.RERANKER_ENABLED,
+        "RERANK_TOP_K": settings.RERANK_TOP_K,
+        "HF_MODEL": settings.HF_MODEL,
+    }
 
 @app.get("/reindex/status")
 def reindex_status():

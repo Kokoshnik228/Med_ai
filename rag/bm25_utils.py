@@ -55,6 +55,8 @@ _PER_DOC_LIMIT_DEFAULT = int(os.getenv("RETR_PER_DOC_LIMIT", "2"))
 
 # -------------------- Утилиты --------------------
 
+
+
 def _normalize_qdrant_url(url_in: Optional[str]) -> str:
     """
     Приводим значение переменной/аргумента к валидному виду:
@@ -263,6 +265,14 @@ def _qdrant_client(url: str):
     prefer_grpc = (os.getenv("QDRANT__PREFER_GRPC", "false").lower() == "true")
     return QdrantClient(url=url, prefer_grpc=prefer_grpc)
 
+def _canon_doc_id(pl: Dict[str, Any], fallback: Optional[str] = None) -> str:
+    for key in ("doc_id", "id", "source", "file", "document_id", "doc", "name"):
+        v = pl.get(key)
+        if v:
+            return str(v)
+    return fallback or "unknown"
+
+
 
 def _rrf_fusion(runs: List[List[str]], k: int = 60, c: int = 60) -> Dict[str, float]:
     """
@@ -367,7 +377,7 @@ def retrieve_hybrid(
         ).points
         for p in pts:
             pl = p.payload or {}
-            did = str(pl.get("doc_id") or "unknown")
+            did = _canon_doc_id(pl, fallback="unknown")
             if did not in qd_payload_first:
                 qd_payload_first[did] = pl
                 qd_docids.append(did)
