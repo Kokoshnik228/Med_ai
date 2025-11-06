@@ -1,4 +1,5 @@
-# === CORE ===
+
+
 fastapi==0.115.2
 uvicorn[standard]==0.32.0
 pydantic==2.9.2
@@ -8,27 +9,27 @@ pyyaml==6.0.2
 python-dotenv==1.0.1
 ruamel.yaml==0.18.6
 
-# === Vector DB / BM25 ===
+
 qdrant-client==1.12.0
-pyserini==0.41.0          # требует openjdk-21-jdk-headless в образе
+pyserini==0.41.0
 rank-bm25==0.2.2
 rapidfuzz==3.9.7
 
-# === Reranker / Embeddings ===
+
 FlagEmbedding==1.2.11
-peft==0.13.2                  # совместимо с transformers<5
+peft==0.13.2
 sentence-transformers>=3.0.0,<4
 transformers==4.44.2
 accelerate>=0.34.0
 
-# === PDF / OCR / Docs ===
+
 chardet==5.2.0
 PyMuPDF==1.24.10
-pytesseract==0.3.13           # CPU-fallback; можно оставить
+pytesseract==0.3.13
 pillow==10.4.0
 python-docx==1.1.2
 
-# === GPU-OCR (EasyOCR) ===
+
 numpy>=1.26
 opencv-python-headless==4.10.0.84
 easyocr==1.7.1
@@ -36,5 +37,6 @@ scikit-image>=0.22
 shapely>=2.0
 python-bidi>=0.4.2
 
-# === Ollama CLI (опционально) ===
+
 ollama==0.3.3
+
