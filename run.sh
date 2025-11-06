@@ -3,11 +3,11 @@ set -euo pipefail
 
 MODE="${1:-}"
 ACTION="${2:-up}"
-ARG3="${3:-}"     # опция: для set-emb и некоторых экшенов
+ARG3="${3:-}"     # опция: для set-emb / set-gpu
 
 usage() {
   cat <<'EOF'
-⚙️  Использование: ./run.sh [dev|prod] [up|down|rebuild|restart|logs|logs-app|ps|sh|env|set-emb|health|pull|build|down-v] [опции]
+⚙️  Использование: ./run.sh [dev|prod] [up|down|rebuild|restart|logs|logs-app|ps|sh|env|set-emb|set-gpu|health|pull|build|down-v] [опции]
 
 Примеры:
   ./run.sh dev                  # Запуск dev (БЕЗ сборки)
@@ -23,8 +23,13 @@ usage() {
   ./run.sh dev env              # Показать текущие переменные для эмбеддинга
   ./run.sh dev set-emb hf       # Записать в .env.dev: EMB_BACKEND=hf, HF_MODEL=...
 
+  # GPU-профиль (compose profile "gpu")
+  ./run.sh dev set-gpu on       # Включить COMPOSE_PROFILES=gpu в .env.dev
+  ./run.sh dev set-gpu off      # Выключить профили (очистить переменную)
+  ./run.sh dev set-gpu auto     # Авто: если есть nvidia, включит gpu
+
   # Дополнительно
-  ./run.sh dev health           # Пинги сервисов и http://localhost:7050/health
+  ./run.sh dev health           # Пинг http://localhost:7050/health
   ./run.sh prod pull            # docker compose pull
   ./run.sh prod build           # docker compose build
   ./run.sh prod down-v          # down -v (сносит volume’ы)
@@ -63,10 +68,17 @@ else
   exit 1
 fi
 
+# Проверим, поддерживается ли флаг --ansi (в некоторых версиях его нет)
+compose_supports_ansi() {
+  "${DCMD[@]}" up --help 2>/dev/null | grep -q -- '--ansi' || return 1
+}
+ANSI_FLAGS=()
+if compose_supports_ansi; then
+  ANSI_FLAGS=(--ansi=always)
+fi
+
 # ---------- helpers для .env ----------
-# кроссплатный sed -i
 _sed_in_place() {
-  # _sed_in_place <file> <sed_script>
   local file="$1"; shift
   if sed --version >/dev/null 2>&1; then
     sed -i "$@" "$file"        # GNU sed
@@ -75,7 +87,7 @@ _sed_in_place() {
   fi
 }
 
-_escape_regex() { printf '%s' "$1" | sed -e 's/[]\/$*.^|[]/\\&/g'; }
+_escape_regex() { printf '%s' "$1" | sed -e 's/[.[\*^$\/|&()-]/\\&/g'; }
 
 # безопасная подстановка key=val (создаём ключ, если его нет)
 set_kv() {
@@ -88,13 +100,13 @@ set_kv() {
   fi
 }
 
-# чтение значения (игнор комментов, пробелы вокруг '=')
+# чтение значения (игнор комментов, пробелы вокруг '='); берём последнее
 get_kv() {
   local file="$1" key="$2"
   awk -F= -v k="$key" '
-    $0 !~ /^[[:space:]]*#/ && $1 ~ "^[[:space:]]*"k"[[:space:]]*$" {
-      sub(/^[[:space:]]+/, "", $2); sub(/[[:space:]]+$/, "", $2); print $2
-    }' "$file" | tail -n1
+    $0 !~ /^[[:space:]]*#/ && $1==k { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); v=$2 }
+    END{ if (v!="") print v }
+  ' "$file"
 }
 
 print_embed_config() {
@@ -130,12 +142,55 @@ set_emb_backend() {
   esac
 }
 
-# ---------- действия чисто для env / set-emb ----------
+detect_gpu() {
+  # 0 = успех (есть nvidia), 1 = нет
+  if command -v nvidia-smi >/dev/null 2>&1; then return 0; fi
+  if command -v docker >/dev/null 2>&1; then
+    if docker info --format '{{json .Runtimes.nvidia}}' 2>/dev/null | grep -qv 'null'; then
+      return 0
+    fi
+  fi
+  return 1
+}
+
+set_gpu_profile() {
+  local file="$1" mode="$2"
+  case "$mode" in
+    on)
+      set_kv "$file" "COMPOSE_PROFILES" "gpu"
+      echo "✅ Включён GPU-профиль (COMPOSE_PROFILES=gpu) в ${file}"
+      ;;
+    off)
+      set_kv "$file" "COMPOSE_PROFILES" ""
+      echo "✅ Выключены compose-профили (COMPOSE_PROFILES очищен) в ${file}"
+      ;;
+    auto)
+      if detect_gpu; then
+        set_kv "$file" "COMPOSE_PROFILES" "gpu"
+        echo "✅ Авто: обнаружена NVIDIA, включён COMPOSE_PROFILES=gpu в ${file}"
+      else
+        set_kv "$file" "COMPOSE_PROFILES" ""
+        echo "ℹ️  Авто: NVIDIA не найдена, профили очищены (CPU-режим)"
+      fi
+      ;;
+    *)
+      echo "❌ set-gpu: используй on|off|auto"; exit 1 ;;
+  esac
+}
+
+print_profiles_hint() {
+  local file="$1"
+  local prof="$(get_kv "$file" "COMPOSE_PROFILES" || true)"
+  echo "   COMPOSE_PROFILES = ${prof:-<пусто>} (gpu-профиль включай через: ./run.sh ${MODE} set-gpu on)"
+}
+
+# ---------- действия чисто для env / set-emb / set-gpu ----------
 case "$ACTION" in
   env)
     echo "📄 Просмотр конфигурации эмбеддинга для $MODE ($ENV_FILE)"
     ensure_defaults "$ENV_FILE"
     print_embed_config "$ENV_FILE"
+    print_profiles_hint "$ENV_FILE"
     exit 0
     ;;
   set-emb)
@@ -143,6 +198,13 @@ case "$ACTION" in
     set_emb_backend "$ENV_FILE" "$ARG3"
     echo "ℹ️  Текущая конфигурация:"
     print_embed_config "$ENV_FILE"
+    print_profiles_hint "$ENV_FILE"
+    exit 0
+    ;;
+  set-gpu)
+    [[ -n "$ARG3" ]] || { echo "❌ Укажи режим: on|off|auto"; exit 1; }
+    set_gpu_profile "$ENV_FILE" "$ARG3"
+    print_profiles_hint "$ENV_FILE"
     exit 0
     ;;
 esac
@@ -152,7 +214,17 @@ ensure_defaults "$ENV_FILE"
 
 echo "🔎 Эмбеддинг-конфиг ($MODE):"
 print_embed_config "$ENV_FILE"
+print_profiles_hint "$ENV_FILE"
 echo
+
+# Прочитаем COMPOSE_PROFILES из env-файла и экспортнём в окружение CLI,
+# чтобы профиль гарантированно применился.
+CURRENT_PROFILES="$(get_kv "$ENV_FILE" "COMPOSE_PROFILES" || true || printf '')"
+if [[ -n "${CURRENT_PROFILES:-}" ]]; then
+  export COMPOSE_PROFILES="${CURRENT_PROFILES}"
+else
+  unset COMPOSE_PROFILES || true
+fi
 
 # URL для health
 case "$MODE" in
@@ -166,11 +238,9 @@ case "$ACTION" in
   up)
     echo "🚀 Запуск $MODE-среды..."
     if [[ "$MODE" == "dev" ]]; then
-      # В dev НЕ строим образы по умолчанию
-      "${DCMD[@]}" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d --no-build
+      "${DCMD[@]}" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d --no-build --remove-orphans "${ANSI_FLAGS[@]}"
     else
-      # В prod по умолчанию строим (как и раньше)
-      "${DCMD[@]}" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d --build
+      "${DCMD[@]}" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d --build --remove-orphans "${ANSI_FLAGS[@]}"
     fi
     echo "⏳ Проверка здоровья сервиса..."
     if command -v curl >/dev/null 2>&1; then
@@ -184,15 +254,15 @@ case "$ACTION" in
     ;;
   down)
     echo "🛑 Останавливаем контейнеры ($MODE)..."
-    "${DCMD[@]}" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" down
+    "${DCMD[@]}" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" down --remove-orphans
     ;;
   down-v)
     echo "🧨 Останавливаем и удаляем volumes ($MODE)..."
-    "${DCMD[@]}" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" down -v
+    "${DCMD[@]}" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" down -v --remove-orphans
     ;;
   rebuild)
     echo "🔄 Пересборка и перезапуск ($MODE)..."
-    "${DCMD[@]}" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d --build
+    "${DCMD[@]}" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d --build --remove-orphans "${ANSI_FLAGS[@]}"
     ;;
   restart)
     echo "♻️  Перезапуск ($MODE)..."

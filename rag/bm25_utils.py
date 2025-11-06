@@ -47,9 +47,11 @@ from transformers import AutoTokenizer, AutoModel
 # Читаем лимиты из ENV (синхрон с runtime_settings.py),
 # с безопасными дефолтами.
 _TEXT_SNIPPET_LIMIT = int(
-    os.getenv("TEXT_SNIPPET_LIMIT")
+    os.getenv("CTX_SNIPPET_LIMIT")
+    or os.getenv("TEXT_SNIPPET_LIMIT")
     or os.getenv("MEDAI_TEXT_SNIPPET_LIMIT", "3500")
 )
+
 _PER_DOC_LIMIT_DEFAULT = int(os.getenv("RETR_PER_DOC_LIMIT", "2"))
 
 
@@ -100,6 +102,9 @@ def _get_lucene_searcher(index_dir: str):
 
 @lru_cache(maxsize=4)
 def _load_bm25_meta(index_dir: str) -> Dict[str, Dict[str, Any]]:
+    """
+    Строит маппинг id чанка -> {doc_id, page, text} из JSONL в index/bm25_json/*.json.
+    """
     base = Path(index_dir)
     meta_dir = base.with_name("bm25_json")
     mapping: Dict[str, Dict[str, Any]] = {}
@@ -108,55 +113,103 @@ def _load_bm25_meta(index_dir: str) -> Dict[str, Dict[str, Any]]:
 
     for p in meta_dir.glob("*.json"):
         try:
-            j = json.loads(p.read_text(encoding="utf-8"))
-            doc_id = j.get("doc_id") or "unknown"
-            page = int(j.get("page") or 1)
-            text = j.get("text") or j.get("contents") or ""
-            _id = j.get("id") or f"{doc_id}#p{page}"
-            mapping[str(_id)] = {"doc_id": doc_id, "page": page, "text": text}
+            with p.open("r", encoding="utf-8") as f:
+                for line in f:
+                    j = json.loads(line)
+                    _id = j.get("id")
+                    contents = j.get("contents", "") or ""
+
+                    # raw -> внутри meta: {"doc_id","page","child_idx"}
+                    doc_id, page = "unknown", 1
+                    raw_meta = j.get("raw")
+                    if isinstance(raw_meta, str):
+                        try:
+                            rm = json.loads(raw_meta)
+                            doc_id = rm.get("doc_id", doc_id)
+                            page = int(rm.get("page", page))
+                        except Exception:
+                            pass
+                    elif isinstance(raw_meta, dict):
+                        doc_id = raw_meta.get("doc_id", doc_id)
+                        page = int(raw_meta.get("page", page))
+
+                    if _id:
+                        mapping[str(_id)] = {
+                            "doc_id": str(doc_id),
+                            "page": int(page),
+                            "text": str(contents)[:_TEXT_SNIPPET_LIMIT],
+                        }
         except Exception:
             continue
     return mapping
 
 
-def _hit_to_record(searcher, hit, meta_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-    rec: Dict[str, Any] = {"doc_id": "unknown", "page": 1, "text": ""}
 
+def _hit_to_record(searcher, hit, meta_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     id_str = getattr(hit, "docid", None)
     if id_str and id_str in meta_map:
         m = meta_map[id_str]
-        return {"doc_id": m["doc_id"], "page": int(m["page"] or 1), "text": (m["text"] or "")[:_TEXT_SNIPPET_LIMIT]}
+        return {
+            "doc_id": m["doc_id"],
+            "page": int(m["page"] or 1),
+            "text": (m["text"] or "")[:_TEXT_SNIPPET_LIMIT],
+        }
+
+    rec: Dict[str, Any] = {"doc_id": "unknown", "page": 1, "text": ""}
 
     try:
         doc = searcher.doc(hit.docid)
         raw = doc.raw() if callable(getattr(doc, "raw", None)) else None
         if raw:
-            try:
-                j = json.loads(raw)
-                text = j.get("text") or j.get("contents") or ""
-                doc_id = j.get("doc_id") or j.get("id") or "unknown"
-                page = int(j.get("page") or 1)
-                return {"doc_id": str(doc_id), "page": page, "text": str(text)[:_TEXT_SNIPPET_LIMIT]}
-            except Exception:
-                pass
+            j = json.loads(raw)  # это тот самый объект {"id","contents","raw": "...meta..."}
+            text = j.get("contents") or ""
+            doc_id = j.get("id") or "unknown"
+            page = 1
+
+            raw_meta = j.get("raw")
+            if isinstance(raw_meta, str):
+                try:
+                    rm = json.loads(raw_meta)
+                    doc_id = rm.get("doc_id", doc_id)
+                    page = int(rm.get("page", page))
+                except Exception:
+                    pass
+            elif isinstance(raw_meta, dict):
+                doc_id = raw_meta.get("doc_id", doc_id)
+                page = int(raw_meta.get("page", page))
+
+            if not text:
+                contents = doc.contents() if callable(getattr(doc, "contents", None)) else None
+                if contents:
+                    text = str(contents)
+
+            return {
+                "doc_id": str(doc_id),
+                "page": int(page),
+                "text": str(text)[:_TEXT_SNIPPET_LIMIT],
+            }
+
+        # fallback: хотя бы contents
         contents = doc.contents() if callable(getattr(doc, "contents", None)) else None
         if contents:
             rec["text"] = str(contents)[:_TEXT_SNIPPET_LIMIT]
     except Exception:
         pass
 
+    # последний вариант — парсим id вида "doc_p12_c3"
     if id_str:
-        m = re.match(r"(.+?)(?:[#_:/-])p?(\d+)$", str(id_str))
+        m = re.match(r"^(?P<doc>.+)_p(?P<page>\d+)_c\d+$", str(id_str))
         if m:
-            rec["doc_id"] = m.group(1)
+            rec["doc_id"] = m.group("doc")
             try:
-                rec["page"] = int(m.group(2))
+                rec["page"] = int(m.group("page"))
             except Exception:
                 rec["page"] = 1
         else:
             rec["doc_id"] = str(id_str)
 
     return rec
+
 
 
 # -------------------- Embeddings (HF Transformers) --------------------

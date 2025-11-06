@@ -1,83 +1,83 @@
 # syntax=docker/dockerfile:1.7
 
 ############################
-# Stage 1: deps (Python venv)
+# Stage 0: base (OS deps)
 ############################
-FROM python:3.11-slim AS deps
+FROM python:3.11-slim AS base
 WORKDIR /app
 
-ENV PIP_DISABLE_PIP_VERSION_CHECK=1 \
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
     PIP_NO_INPUT=1 \
     PIP_DEFAULT_TIMEOUT=100 \
     PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-# Системные пакеты для Pyserini (JDK), OCR (tesseract + языки), рендера (libgl1),
-# OpenCV (libglib2.0-0), диагностики (curl), и bash для скриптов
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Кэшируем ТОЛЬКО /var/cache/apt (sharing=locked). /var/lib/apt НЕ кэшируем.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    apt-get update && \
+    apt-get install -y --no-install-recommends \
       openjdk-21-jdk-headless \
       tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus \
       libgl1 libglib2.0-0 \
       curl ca-certificates \
-      bash \
-    && rm -rf /var/lib/apt/lists/*
+      bash && \
+    rm -rf /var/lib/apt/lists/*
 
-# Виртуалка для зависимостей
+ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
+ENV PATH="${JAVA_HOME}/bin:${PATH}"
+
+############################
+# Stage 1: deps (Python venv)
+############################
+FROM base AS deps
+
 RUN python -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
+ENV PATH="/opt/venv/bin:${PATH}"
+ENV PIP_CACHE_DIR=/root/.cache/pip
 
-# ===== PyTorch =====
-# Если нужен CUDA-рантайм — укажи канал:
-#   --build-arg TORCH_CHANNEL=https://download.pytorch.org/whl/cu124
-# или актуальный канал cu12X (см. документацию PyTorch).
-# На CPU: оставь пустым (по умолчанию).
-ARG TORCH_CHANNEL=""
-ARG TORCH_VERSION="2.3.*"
+# 1) Копируем lock и вырезаем тяжёлые пакеты (torch/xformers/triton и nvidia-* cuda wheels)
+COPY requirements.txt /tmp/requirements.lock
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    awk 'BEGIN{skip=0} \
+         /^[[:space:]]*(torch|torchvision|torchaudio)==/ {next} \
+         /^[[:space:]]*nvidia-.*-cu1[23]/ {next} \
+         /^[[:space:]]*triton==/ {next} \
+         {print}' /tmp/requirements.lock \
+    | sed -E '/--hash=sha256:[0-9a-f]{64}/d' \
+    | sed -E 's/[[:space:]]*\\$//g' \
+    > /tmp/requirements.clean && \
+    pip install --no-cache-dir --no-deps -r /tmp/requirements.clean
 
-RUN --mount=type=cache,target=/root/.cache/pip \
-    if [ -n "$TORCH_CHANNEL" ]; then \
-      pip install --no-cache-dir --index-url "$TORCH_CHANNEL" "torch==${TORCH_VERSION}"; \
-    else \
-      pip install --no-cache-dir "torch==${TORCH_VERSION}"; \
-    fi
+# 2) Ставим «остальные» пакеты из очищенного lock-файла БЕЗ разрешения зависимостей
+#    (в lock уже зафиксированы все транзитивные зависимости, кроме удалённых нами torch/nvidia-*)
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip install --no-cache-dir --no-deps -r /tmp/requirements.clean
 
-# Остальные Python-зависимости
-COPY requirements.txt .
-RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --no-cache-dir -r requirements.txt
-
+# 3) Ставим Torch с CUDA отдельно (по умолчанию cu124 — оптимально для RTX 50xx/5090)
+ARG TORCH_CHANNEL="https://download.pytorch.org/whl/cu128"
+ARG TORCH_VERSION="2.9.*"
+RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
+    pip install --no-cache-dir --index-url "$TORCH_CHANNEL" "torch==${TORCH_VERSION}"
+# Sanity-check (не валим билд, просто печатаем)
+RUN python - <<'PY' || true
+import torch
+print("Torch:", torch.__version__, "| CUDA avail:", torch.cuda.is_available(), "| CUDA:", torch.version.cuda)
+PY
 
 ############################
 # Stage 2: runtime
 ############################
-FROM python:3.11-slim AS runtime
+FROM base AS runtime
 WORKDIR /app
 
-# На runtime тоже нужны JDK, tesseract, libgl1/libglib2.0-0, curl и bash
-RUN apt-get update && apt-get install -y --no-install-recommends \
-      openjdk-21-jdk-headless \
-      tesseract-ocr tesseract-ocr-eng tesseract-ocr-rus \
-      libgl1 libglib2.0-0 \
-      curl ca-certificates \
-      bash \
-    && rm -rf /var/lib/apt/lists/*
-
-# JAVA_HOME для pyserini/pyjnius
-ENV JAVA_HOME=/usr/lib/jvm/java-21-openjdk-amd64
-ENV PATH="${JAVA_HOME}/bin:/opt/venv/bin:${PATH}" \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
-
-# Переносим venv со всеми установленными пакетами
 COPY --from=deps /opt/venv /opt/venv
+ENV PATH="/opt/venv/bin:${PATH}"
 
-# Копируем код после зависимостей (лучший build cache)
 COPY . .
 
-# Стартовый скрипт
 RUN chmod +x /app/start.sh
 
-# --------- defaults (перекрывай через compose) ----------
 ENV QDRANT_URL=http://qdrant:6333 \
     QDRANT__PREFER_GRPC=false \
     EMB_BACKEND=hf \
@@ -87,8 +87,9 @@ ENV QDRANT_URL=http://qdrant:6333 \
     LLM_BASE_URL=http://host.docker.internal:11434 \
     APP_ENV=dev \
     APP_PORT=8000 \
-    APP_HOST=0.0.0.0
+    APP_HOST=0.0.0.0 \
+    HF_HOME=/root/.cache/huggingface \
+    TRANSFORMERS_CACHE=/root/.cache/huggingface
 
 EXPOSE 8000
-
 CMD ["bash", "/app/start.sh"]

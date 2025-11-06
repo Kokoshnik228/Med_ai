@@ -12,11 +12,15 @@
     --out-json index/bm25_json --index-dir index/bm25_idx
 """
 from __future__ import annotations
-import argparse, json, subprocess, re
+
+import os
+import argparse
+import json
+import subprocess
+import re
 from pathlib import Path
 from typing import Dict, Any, List
 from tqdm import tqdm
-from rag.bm25_utils import bm25_search
 
 
 def words(text: str) -> List[str]:
@@ -45,7 +49,7 @@ def is_noise_text(text: str) -> bool:
     # много точек и цифр — вероятно, оглавление
     punct_density = text.count('.') / max(len(text), 1)
     digit_density = sum(ch.isdigit() for ch in text) / max(len(text), 1)
-    if punct_density > 0.2 and digit_density > 0.1:
+    if punct_density > 0.25 and digit_density > 0.15:
         return True
 
     # слишком много повторов пунктов "1.1", "2.3" и т.п.
@@ -57,12 +61,13 @@ def is_noise_text(text: str) -> bool:
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Build BM25 index from pages.jsonl")
+    ap.add_argument("--language", default="ru", help="Analyzer language for Lucene (e.g., ru, en, ...)")
+    ap.add_argument("--threads", type=int, default=os.cpu_count() or 4)
     ap.add_argument("--pages-glob", required=True)
     ap.add_argument("--out-json", default="index/bm25_json")
     ap.add_argument("--index-dir", default="index/bm25_idx")
     ap.add_argument("--child-w", type=int, default=200)
     ap.add_argument("--child-overlap", type=int, default=40)
-    ap.add_argument("--threads", type=int, default=4)
     args = ap.parse_args()
 
     pages_files = sorted(Path().glob(args.pages_glob))
@@ -89,7 +94,6 @@ def main() -> int:
             print(f"⚠️ Пропуск пустого документа: {fp.name}")
             continue
 
-        child_idx = 0
         kept = 0
         skipped = 0
         with out_path.open("w", encoding="utf-8") as fout:
@@ -103,7 +107,6 @@ def main() -> int:
                     if is_noise_text(text):
                         skipped += 1
                         continue  # пропускаем мусорные чанки
-                    child_idx += 1
                     kept += 1
                     chunk_id = f"{doc_id}_p{p['page']}_c{c_i}"
                     obj = {
@@ -130,6 +133,7 @@ def main() -> int:
         "--index", str(index_dir.resolve()),
         "--generator", "DefaultLuceneDocumentGenerator",
         "--threads", str(args.threads),
+        "--language", args.language,                 # важно для русского
         "--storePositions", "--storeDocvectors", "--storeRaw",
     ]
 

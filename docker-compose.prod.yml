@@ -1,79 +1,96 @@
-version: "3.9"
-
 services:
   qdrant:
     image: qdrant/qdrant:latest
     container_name: medai_qdrant_prod
     restart: unless-stopped
     ports:
-      - "7778:6333"              # внешний 7778 → внутренний 6333
+      - "7778:6333"                       # внешний 7778 → внутренний 6333
     volumes:
       - qdrant_storage_prod:/qdrant/storage
     healthcheck:
-      # сначала пытаемся HTTP, если wget нет — проверяем TCP-порт
-      test: ["CMD-SHELL", "([ -x /usr/bin/wget ] && wget -qO- http://localhost:6333/readyz >/dev/null) || (echo > /dev/tcp/localhost/6333)"]
+      # сначала HTTP, иначе проверяем TCP-порт
+      test: ["CMD-SHELL", "(command -v curl >/dev/null && curl -fsS http://localhost:6333/readyz >/dev/null) || (echo > /dev/tcp/localhost/6333)"]
       interval: 10s
       timeout: 5s
       retries: 10
       start_period: 10s
 
   app:
-    build: .
+    # ВАЖНО: прод работает из ПРЕДСОБРАННОГО образа.
+    # Укажи тег образа через .env.prod → APP_IMAGE_TAG=prod-<commit>
+    image: med_ai-app:${APP_IMAGE_TAG:-prod}
     container_name: medai_app_prod
     restart: unless-stopped
+
     depends_on:
       qdrant:
         condition: service_healthy
+
+    # GPU для PyTorch/FlagEmbedding (нужен NVIDIA Container Toolkit)
+    gpus: "all"
+    shm_size: "2g"
 
     environment:
       # --- База знаний ---
       QDRANT_URL: "http://qdrant:6333"
       QDRANT_COLLECTION: "med_kb_v3"
-      QDRANT__PREFER_GRPC: "false"     # принудительно HTTP
+      QDRANT__PREFER_GRPC: "false"
 
-      # --- Эмбеддинги: HF (GPU) ---
+      # --- Эмбеддинги HF (GPU) ---
       EMB_BACKEND: "hf"
       HF_MODEL: "BAAI/bge-m3"
-      HF_DEVICE: "cuda"                # можно убрать или заменить на "auto"
+      HF_DEVICE: "cuda"
+      EMB_BATCH: "128"                     # безопасный батч по умолчанию
 
-      # --- Reranker (если используешь) ---
+      # --- Reranker (опционально) ---
       RERANKER_MODEL: "BAAI/bge-reranker-v2-m3"
+
+      # --- CUDA аллокатор: меньше фрагментации VRAM ---
+      PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:128,expandable_segments:True,garbage_collection_threshold:0.7"
+
+      # --- Кэши (персистентно в named volumes) ---
+      HF_HOME: "/root/.cache/huggingface"
+      TRANSFORMERS_CACHE: "/root/.cache/huggingface"
+      HUGGINGFACE_HUB_CACHE: "/root/.cache/huggingface"
+      EASYOCR_DIR: "/root/.EasyOCR"
+      EASYOCR_ALLOW_DOWNLOADS: "1"
 
       # --- Конфиг приложения ---
       APP_ENV: "prod"
       APP_HOST: "0.0.0.0"
       APP_PORT: "8000"
-      APP_WORKERS: "2"
+      WEB_CONCURRENCY: "2"
 
-      # --- LLM (опционально; по умолчанию в коде host.docker.internal:11434) ---
+      # --- LLM (если нужен Ollama на хосте) ---
       # MODEL_ID: "llama3.1:8b"
       # LLM_BASE_URL: "http://host.docker.internal:11434"
 
     ports:
       - "8050:8000"
 
+    # только данные/индексы/сырые документы и кэши — НИКАКИХ маунтов кода!
     volumes:
       - ./data:/app/data
       - ./index:/app/index
       - ./raw_docs:/app/raw_docs
-
-    command: ["bash", "start.sh"]
+      - hf_cache:/root/.cache/huggingface
+      - easyocr_cache:/root/.EasyOCR
 
     # корректная резолюция host.docker.internal на Linux
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
-    # GPU для PyTorch/FlagEmbedding (нужен NVIDIA Container Toolkit)
-    gpus: "all"
-    shm_size: "2g"
-
-    # (необязательно) healthcheck самого API
+    # health самого API
     healthcheck:
       test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health >/dev/null || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 10
-      start_period: 15s
+      start_period: 20s
+
+    command: ["bash", "start.sh"]
 
 volumes:
   qdrant_storage_prod:
+  hf_cache:
+  easyocr_cache:

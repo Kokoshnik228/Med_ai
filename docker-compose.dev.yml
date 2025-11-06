@@ -10,9 +10,19 @@ services:
     volumes:
       - qdrant_storage_dev:/qdrant/storage
 
-
   app:
-    build: .
+    # GPU-профиль включён по умолчанию через .env.dev → COMPOSE_PROFILES=gpu
+    profiles:
+      - gpu
+
+    build:
+      context: .
+      # Поддержка CUDA-сборки torch из Dockerfile:
+      # TORCH_CHANNEL пустой => CPU; cu124 => CUDA 12.4 и т.п.
+      args:
+        TORCH_CHANNEL: ${TORCH_CHANNEL:-https://download.pytorch.org/whl/cu128}
+        TORCH_VERSION: ${TORCH_VERSION:-2.9.*}
+
     container_name: medai_app_dev
     restart: unless-stopped
     depends_on:
@@ -23,8 +33,14 @@ services:
 
     # GPU
     gpus: all
+    shm_size: "1g"
 
     environment:
+      # PyTorch allocator (ВАЖНО: именно двоеточие, не равно)
+      PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:128,garbage_collection_threshold:0.7,expandable_segments:True"
+      TOKENIZERS_PARALLELISM: "false"
+      CUDA_VISIBLE_DEVICES: "0"
+
       APP_HOST: "0.0.0.0"
       APP_PORT: "8000"
       QDRANT_URL: "http://qdrant:6333"
@@ -33,8 +49,11 @@ services:
       # Кэши под root в контейнере
       EASYOCR_DIR: "/root/.EasyOCR"
       EASYOCR_ALLOW_DOWNLOADS: "1"
+      HF_HOME: "/root/.cache/huggingface"
       TRANSFORMERS_CACHE: "/root/.cache/huggingface"
       HUGGINGFACE_HUB_CACHE: "/root/.cache/huggingface"
+
+      # GPU по умолчанию (runtime_settings может переопределить при apply_env)
       HF_DEVICE: "cuda"
 
     ports:

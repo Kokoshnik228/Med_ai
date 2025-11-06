@@ -22,9 +22,10 @@
     --qdrant-url http://localhost:7779 --only-new --batch 128
 """
 from __future__ import annotations
-
+import os
 # ----------------- imports -----------------
 import argparse
+import numpy as np
 import hashlib
 import json
 import re
@@ -231,6 +232,7 @@ def ollama_embed_batch(session: requests.Session, base_url: str, model: str, tex
 class HFEmbedder:
     def __init__(self, model_name: str, device_hint: Optional[str] = None, use_fp16: bool = False):
         from FlagEmbedding import BGEM3FlagModel
+       
         if device_hint:
             device = device_hint
         else:
@@ -238,16 +240,54 @@ class HFEmbedder:
         fp16 = bool(use_fp16) or device.startswith("cuda")
         print(f"🧠 HF embedder: {model_name} on {device} (fp16={fp16})")
         self.model = BGEM3FlagModel(model_name, use_fp16=fp16, device=device)
+        self.default_batch = int(os.getenv("EMB_BATCH", "128") or "128")
+
 
     def get_dim(self) -> int:
         vec = self.embed_texts(["probe"])[0]
         return len(vec)
 
-    def embed_texts(self, texts: List[str], batch_size: int = 256) -> List[List[float]]:
-        out = self.model.encode(texts, batch_size=max(1, batch_size))
-        dense = out["dense_vecs"]  # numpy.ndarray
-        return [l2_unit(v.tolist()) for v in dense]
+    def embed_texts(self, texts, batch_size: int | None = None):
+        """
+        Возвращает np.ndarray (N, D) с плотными эмбеддингами.
+        Нормализует разные форматы выдачи библиотек (dict / list / np.array).
+        """
+        bs = int(batch_size or getattr(self, "default_batch", 128))
+        # Пытаемся попросить только dense-выдачу, чтобы экономить память
+        try:
+            out = self.model.encode(
+                texts,
+                batch_size=max(1, bs),
+                return_dense=True,
+                return_sparse=False,
+                return_colbert_vecs=False,
+                normalize_embeddings=True,
+            )
+        except TypeError:
+            # Некоторые реализации не знают этих флагов
+            out = self.model.encode(texts, batch_size=max(1, bs))
 
+        # Нормализация формата
+        if isinstance(out, dict):
+            if "dense_vecs" in out and out["dense_vecs"] is not None:
+                vecs = out["dense_vecs"]
+            elif "embeddings" in out and out["embeddings"] is not None:
+                vecs = out["embeddings"]
+            elif "sentence_embeddings" in out and out["sentence_embeddings"] is not None:
+                vecs = out["sentence_embeddings"]
+            else:
+                raise ValueError(f"Неожиданный формат encode(): ключи {list(out.keys())}")
+        else:
+            vecs = out
+
+        vecs = np.asarray(vecs)
+        if vecs.ndim == 1:
+            vecs = vecs.reshape(1, -1)
+        return vecs
+    def get_dim(self) -> int:
+        vecs = self.embed_texts(["probe"], batch_size=4)
+        # vecs гарантированно np.ndarray (N, D)
+        return int(vecs.shape[-1])
 # ----------------- Qdrant helpers -----------------
 def ensure_collection(client: QdrantClient, name: str, dim: int, recreate: bool = False) -> None:
     if recreate and client.collection_exists(name):

@@ -8,8 +8,7 @@ RAW (PDF/DOCX/TXT) -> data/*.pages.jsonl + data/manifest.json
 - DOCX/TXT: нарезка на «псевдо-страницы» фиксированной длины (по умолчанию 1800 символов),
   чтобы down-stream (BM25/Qdrant/цитаты) работал одинаково с PDF.
 - Инкрементальность: обрабатываем только новые/изменённые файлы (по SHA1), если НЕ указан --force.
-- EasyOCR: тёплый старт для скачивания моделей один раз; в воркерах скачивание отключено
-  (исключает гонку '.../model/temp.zip').
+- EasyOCR: «тёплый старт» для скачивания моделей один раз; в воркерах скачивание отключено.
 
 Зависимости (в контейнере app):
   pip install chardet pymupdf pillow python-docx
@@ -28,7 +27,10 @@ import hashlib
 from pathlib import Path
 from typing import Dict, Any, List, Optional
 from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
+from time import perf_counter
 
+import numpy as np
 import chardet
 
 # ---------- опциональные импорты ----------
@@ -61,7 +63,6 @@ except Exception:
 # OpenCV (предобработка для OCR)
 try:
     import cv2
-    import numpy as np
     CV_AVAILABLE = True
 except Exception:
     CV_AVAILABLE = False
@@ -145,6 +146,44 @@ def split_text_to_pages(full_text: str, page_size_chars: int = 1800) -> List[Dic
     return pages or [{"page": 1, "text": text[:page_size_chars]}]
 
 
+# ================== DOCX ==================
+
+def extract_docx_text(path: Path) -> str:
+    """Извлечь текст из DOCX (абзацы + таблицы)."""
+    if Document is None:
+        print("[ERR] python-docx не установлен. Добавь `python-docx` в зависимости.", file=sys.stderr)
+        return ""
+    try:
+        doc = Document(str(path))
+    except Exception as e:
+        print(f"[ERR] Не удалось открыть DOCX {path.name}: {e}", file=sys.stderr)
+        return ""
+
+    parts: List[str] = []
+    # абзацы
+    for p in doc.paragraphs:
+        t = (p.text or "").strip()
+        if t:
+            parts.append(t)
+    # таблицы
+    for table in doc.tables:
+        for row in table.rows:
+            cells = [ (c.text or "").strip() for c in row.cells ]
+            line = " | ".join([c for c in cells if c])
+            if line:
+                parts.append(line)
+
+    return "\n".join(parts).strip()
+
+
+def ingest_docx(path: Path, page_size_chars: int = 1800) -> List[Dict[str, Any]]:
+    """DOCX -> список {page, text} (как у PDF/TXT)."""
+    raw = extract_docx_text(path)
+    if not raw:
+        return [{"page": 1, "text": ""}]
+    return split_text_to_pages(raw, page_size_chars=page_size_chars)
+
+
 # ================== OCR Backends ==================
 
 def ocr_page_tesseract(img_pil: "Image.Image", lang: str) -> str:
@@ -203,38 +242,40 @@ def ingest_pdf(
     for i, page in enumerate(doc, start=1):
         txt = (page.get_text("text") or "").strip()
 
-        do_ocr = False
+        # решаем, делать ли OCR
         if ocr_mode == "always":
             do_ocr = True
         elif ocr_mode == "auto":
             do_ocr = (len(txt) < min_chars)
-        else:  # never
+        else:  # "never"
             do_ocr = False
 
+        # сам OCR (ВНЕ ветки "never")
         if do_ocr:
-            # Рендер в PIL
             if ocr_backend == "tesseract":
                 zoom = dpi / 72.0
                 mat = fitz.Matrix(zoom, zoom)
                 pix = page.get_pixmap(matrix=mat, alpha=False)
                 img_pil = pixmap_to_pil(pix)
-            else:  # easyocr
-                # 2x масштаб для устойчивости к мелкому шрифту
+
+                img_pil = preprocess_pil(img_pil)
+                txt_ocr = ocr_page_tesseract(img_pil, ocr_lang)
+
+            elif ocr_backend == "easyocr":
                 pix = page.get_pixmap(matrix=fitz.Matrix(2.0, 2.0), alpha=False)
                 img_pil = pixmap_to_pil(pix)
 
-            img_pil = preprocess_pil(img_pil)
-
-            if ocr_backend == "easyocr":
+                img_pil = preprocess_pil(img_pil)
                 txt_ocr = ocr_page_easyocr(img_pil, easy_reader)
+
             else:
-                txt_ocr = ocr_page_tesseract(img_pil, ocr_lang)
+                txt_ocr = ""
 
             if len(txt_ocr) > len(txt):
                 txt = txt_ocr
                 if verbose:
                     print(f"[OCR-{ocr_backend}] {pdf_path.name} p.{i}: len={len(txt)}")
-            elif verbose and ocr_mode != "never":
+            elif verbose and ocr_mode != "never" and txt_ocr:
                 print(f"[OCR-{ocr_backend}] {pdf_path.name} p.{i}: OCR не улучшил текст (len={len(txt)})")
 
         if txt:
@@ -243,19 +284,6 @@ def ingest_pdf(
         pages.append({"page": i, "text": txt})
 
     return pages
-
-
-def ingest_docx(docx_path: Path, page_size_chars: int = 1800) -> List[Dict[str, Any]]:
-    if Document is None:
-        raise RuntimeError("python-docx не установлен (pip install python-docx)")
-    d = Document(str(docx_path))
-    buf = []
-    for p in d.paragraphs:
-        t = (p.text or "").strip()
-        if t:
-            buf.append(t)
-    full = "\n".join(buf).strip()
-    return split_text_to_pages(full, page_size_chars=page_size_chars)
 
 
 def ingest_txt(txt_path: Path, page_size_chars: int = 1800) -> List[Dict[str, Any]]:
@@ -296,12 +324,13 @@ def process_one_file(
     *,
     min_chars: int,
     ocr_mode: str,
-    ocr_backend_eff: str,  # уже выбранный эффективный backend
+    ocr_backend_eff: str,
     ocr_lang: str,
     dpi: int,
     verbose: bool,
     page_size_chars: int,
     easyocr_dir: Path,
+    easyocr_use_gpu: bool,
 ) -> Dict[str, Any]:
     """Процессинг одного файла (без доступа к manifest). Возвращает entry + путь pages."""
     sha = file_sha1(f)
@@ -309,21 +338,15 @@ def process_one_file(
     doc_id = stem  # уникализацию по doc_id решаем на верхнем уровне, если потребуется
     out_pages = out_dir / f"{doc_id}.pages.jsonl"
 
-    # OCR init (easyocr локально в процессе; скачивания не допускаем)
+    # OCR init (EasyOCR в этом процессе; скачивания не допускаем)
     easy_reader = None
     if ocr_mode != "never" and ocr_backend_eff == "easyocr":
-        use_gpu = False
-        try:
-            import torch
-            use_gpu = torch.cuda.is_available()
-        except Exception:
-            pass
-        # скачивание запрещено в воркерах
         easy_reader = easyocr.Reader(
             ['ru', 'en'],
-            gpu=use_gpu,
+            gpu=easyocr_use_gpu,
             model_storage_directory=str(easyocr_dir),
-            download_enabled=False
+            download_enabled=False,
+            verbose=False,
         )
 
     # Парсинг
@@ -442,6 +465,9 @@ def main():
 
     # Эффективный OCR backend с учётом установленного
     ocr_backend_eff = choose_ocr_backend(args.ocr_backend)
+    if ocr_backend_eff == "none":
+        args.ocr_mode = "never"
+
     easyocr_dir = Path(os.getenv("EASYOCR_DIR", str(Path.home() / ".EasyOCR"))).expanduser()
     ensure_dir(easyocr_dir / "model")
 
@@ -459,33 +485,60 @@ def main():
             use_gpu = torch.cuda.is_available()
         except Exception:
             pass
-        # ВНИМАНИЕ: здесь download_enabled=True (разрешаем скачивание ровно один раз)
+        # Разрешаем скачивание РОВНО один раз
         easyocr.Reader(['ru','en'], gpu=use_gpu,
                        model_storage_directory=str(easyocr_dir),
-                       download_enabled=True)
+                       download_enabled=True,
+                       verbose=False)
         # первый прогон — без параллелизма (исключаем гонки)
         args.workers = 1
 
     # Параллелизм по файлам
     workers = args.workers or max(1, os.cpu_count() or 1)
+
+    # Если EasyOCR — предпочитаем одиночный процесс, чтобы дать CUDA работать
+    easyocr_use_gpu = False
+    if args.ocr_mode != "never" and ocr_backend_eff == "easyocr":
+        if workers > 1:
+            print("⚠️ EasyOCR: переключаюсь на workers=1 для стабильности и GPU.")
+            workers = 1
+        try:
+            import torch
+            easyocr_use_gpu = torch.cuda.is_available()
+        except Exception:
+            easyocr_use_gpu = False
+        print(f"EasyOCR init планируется с GPU={easyocr_use_gpu}")
+
+    total = len(plan)
+    print(f"📦 Ingest started: {total} files (workers={workers}, ocr={args.ocr_mode}/{ocr_backend_eff})")
+
     results: List[Dict[str, Any]] = []
+    t_start = perf_counter()
 
     if workers <= 1 or len(plan) == 1:
-        for f in plan:
-            r = process_one_file(
-                f, out_dir,
-                min_chars=args.min_chars,
-                ocr_mode=args.ocr_mode,
-                ocr_backend_eff=ocr_backend_eff,
-                ocr_lang=args.ocr_lang,
-                dpi=args.dpi,
-                verbose=args.verbose,
-                page_size_chars=args.page_size_chars,
-                easyocr_dir=easyocr_dir
-            )
-            results.append(r)
+        for i, f in enumerate(plan, 1):
+            t0 = perf_counter()
+            try:
+                r = process_one_file(
+                    f, out_dir,
+                    min_chars=args.min_chars,
+                    ocr_mode=args.ocr_mode,
+                    ocr_backend_eff=ocr_backend_eff,
+                    ocr_lang=args.ocr_lang,
+                    dpi=args.dpi,
+                    verbose=args.verbose,
+                    page_size_chars=args.page_size_chars,
+                    easyocr_dir=easyocr_dir,
+                    easyocr_use_gpu=easyocr_use_gpu,
+                )
+                results.append(r)
+                dt = perf_counter() - t0
+                print(f"[{i}/{total}] {f.name}: {r['pages']} pages, empty={r['empty_pages']}, ocr={r['ocr_backend']}/{r['ocr_mode']} ({dt:.2f}s)")
+            except Exception as e:
+                print(f"[ERR] {f.name}: {e}", file=sys.stderr)
     else:
-        with ProcessPoolExecutor(max_workers=workers) as ex:
+        mp_ctx = mp.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=workers, mp_context=mp_ctx) as ex:
             futs = {
                 ex.submit(
                     process_one_file, f, out_dir,
@@ -496,14 +549,20 @@ def main():
                     dpi=args.dpi,
                     verbose=args.verbose,
                     page_size_chars=args.page_size_chars,
-                    easyocr_dir=easyocr_dir
+                    easyocr_dir=easyocr_dir,
+                    easyocr_use_gpu=False,  # в мультипроцессе — без CUDA
                 ): f for f in plan
             }
+            done = 0
             for fut in as_completed(futs):
+                f = futs[fut]
                 try:
-                    results.append(fut.result())
+                    r = fut.result()
+                    results.append(r)
+                    done += 1
+                    print(f"[{done}/{total}] {f.name}: {r['pages']} pages, empty={r['empty_pages']}, ocr={r['ocr_backend']}/{r['ocr_mode']}")
                 except Exception as e:
-                    print(f"[ERR] {futs[fut].name}: {e}", file=sys.stderr)
+                    print(f"[ERR] {f.name}: {e}", file=sys.stderr)
 
     # Обновляем manifest и уникализируем doc_id при коллизии
     for r in results:
@@ -522,7 +581,6 @@ def main():
             try:
                 op.rename(op_renamed)
             except FileNotFoundError:
-                # на всякий случай, если уже переименовали/не создался
                 pass
             r["doc_id"] = new_id
             r["out_pages"] = str(op_renamed)
@@ -549,11 +607,9 @@ def main():
         else:
             manifest["docs"].append(entry)
 
-        if args.verbose and r["empty_pages"]:
-            print(f"[WARN] {Path(src).name}: пустых страниц {r['empty_pages']}")
-
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"\nГотово ✅: обработано файлов = {len(results)}. Обновлён {manifest_path}")
+    total_dt = perf_counter() - t_start
+    print(f"\nГотово ✅: обработано файлов = {len(results)} за {total_dt:.2f}s. Обновлён {manifest_path}")
     return 0
 
 

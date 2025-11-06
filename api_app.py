@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+
 import json
 import os
 import re
@@ -7,39 +8,13 @@ import socket
 import subprocess
 import threading
 import time
+import importlib
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from glob import glob
-import importlib  # ← для горячей подгрузки runtime_settings.py
-from config.runtime_settings import settings
-
-
-# RAG utils
-from rag.bm25_utils import bm25_search, retrieve_hybrid, embed_query_hf
-
-import requests
-import yaml
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field
-try:
-    # pydantic v2
-    from pydantic import field_validator  # type: ignore
-    _P_V2 = True
-except Exception:
-    # pydantic v1
-    from pydantic import validator as field_validator  # type: ignore
-    _P_V2 = False
 
 # ================================
-# .env загрузка (dev/prod)
+# .env -> runtime_settings (правильный порядок)
 # ================================
-import os
-from pathlib import Path
-# ... остальные стандартные импорты выше или ниже — неважно, главное чтобы до использования settings
-
-# ---- load .env, затем загрузить runtime_settings, затем продавить значения из файла в env ----
 try:
     from dotenv import load_dotenv
     env_mode = (os.getenv("APP_ENV") or "dev").strip().lower()
@@ -50,21 +25,35 @@ try:
 except Exception as e:
     print(f"⚠️ dotenv load skipped: {e}")
 
+# runtime settings: после .env
+from config.runtime_settings import settings  # noqa: E402
+try:
+    # важное: продавливаем CONTROL в окружение и объект
+    settings.apply_env(force=True)
+except Exception:
+    pass
 
+# ================================
+# Импорты после настройки окружения
+# ================================
+from glob import glob  # noqa: F401
+import requests
+import yaml
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from pydantic import BaseModel, Field
 
-# Нормализация env
-if os.getenv("EMBEDDING_MODEL") and not os.getenv("HF_MODEL"):
-    os.environ["HF_MODEL"] = os.getenv("EMBEDDING_MODEL", "")
-if not os.getenv("EMB_BACKEND"):
-    os.environ["EMB_BACKEND"] = "hf"
+# pydantic v1/v2 совместимость
+try:
+    from pydantic import field_validator  # type: ignore
+    _P_V2 = True
+except Exception:
+    from pydantic import validator as field_validator  # type: ignore
+    _P_V2 = False
 
-# Автовыбор устройства для HF
-if not os.getenv("HF_DEVICE"):
-    try:
-        import torch
-        os.environ["HF_DEVICE"] = "cuda" if torch.cuda.is_available() else "auto"
-    except Exception:
-        os.environ["HF_DEVICE"] = "auto"
+# RAG utils
+from rag.bm25_utils import bm25_search, retrieve_hybrid, embed_query_hf  # noqa: F401
 
 # Глобальная HTTP-сессия (keep-alive)
 _HTTP = requests.Session()
@@ -81,7 +70,7 @@ app.add_middleware(
 )
 
 # ================================
-# Config
+# Config (yaml + runtime overrides)
 # ================================
 ROOT = Path(__file__).resolve().parent
 os.chdir(ROOT)
@@ -91,9 +80,7 @@ DEFAULT_YAML = CONF_DIR / "default.yaml"
 LOCAL_YAML = CONF_DIR / "local.yaml"
 
 def load_runtime_overrides() -> Dict[str, Any]:
-    """
-    Подхватывает config/runtime_settings.py (dict RUNTIME), можно менять без пересборки.
-    """
+    """Подхватывает config/runtime_settings.py (dict RUNTIME), можно менять без пересборки."""
     try:
         import config.runtime_settings as rs  # type: ignore
         importlib.reload(rs)
@@ -105,7 +92,29 @@ def load_runtime_overrides() -> Dict[str, Any]:
         print(f"⚠️ runtime overrides not loaded: {e}")
     return {}
 
+def env_bool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return bool(default)
+    v = str(v).strip().lower()
+    if v in ("1", "true", "yes", "y", "on"):
+        return True
+    if v in ("0", "false", "no", "n", "off", ""):
+        return False
+    # на всякий случай: попробуем как int
+    try:
+        return bool(int(v))
+    except Exception:
+        return bool(default)
+
+def _env_flag(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return bool(default)
+    return str(v).strip().lower() in ("1", "true", "yes", "on")
+
 def load_config() -> Dict[str, Any]:
+    
     def _load_yaml(p: Path) -> Dict[str, Any]:
         try:
             data = yaml.safe_load(p.read_text(encoding="utf-8")) if p.exists() else {}
@@ -116,26 +125,29 @@ def load_config() -> Dict[str, Any]:
     DEFAULTS = {
         "app": {"data_dir": "data", "bm25_index_dir": "index/bm25_idx"},
         "qdrant": {
-            "url": os.getenv("QDRANT_URL", "http://localhost:7779"),
+            "url": os.getenv("QDRANT_URL", "http://qdrant:6333"),
             "collection": os.getenv("QDRANT_COLLECTION", "med_kb_v3"),
         },
         "ollama": {
             "base_url": os.getenv("LLM_BASE_URL", "http://host.docker.internal:11434"),
-            "model": os.getenv("MODEL_ID", os.getenv("LLM_MODEL", "llama3.1:8b")),
-            # ↓ параметры «как долго/много думает»
+            "model": os.getenv("LLM_MODEL", os.getenv("MODEL_ID", "llama3.1:8b")),
             "max_tokens": int(os.getenv("LLM_MAX_TOKENS", "2048")),
             "timeout_s": int(os.getenv("LLM_TIMEOUT", "60")),
             "temperature": float(os.getenv("LLM_TEMPERATURE", "0.4")),
             "top_p": float(os.getenv("LLM_TOP_P", "0.95")),
             "num_ctx": int(os.getenv("LLM_NUM_CTX", "6144")),
         },
-        "retrieval": {"k": 8},
+
+
+        "retrieval": {"k": settings.RETR_TOP_K},
         "embedding": {
-            "backend": os.getenv("EMB_BACKEND", "hf"),
-            "model": os.getenv("HF_MODEL", os.getenv("EMBEDDING_MODEL", "BAAI/bge-m3")),
-            "device": os.getenv("HF_DEVICE", "auto"),
-            "fp16": False,
+            "backend": os.getenv("EMB_BACKEND", settings.EMB_BACKEND or "hf"),
+            "model": os.getenv("HF_MODEL", settings.HF_MODEL or "BAAI/bge-m3"),
+            "device": os.getenv("HF_DEVICE", settings.HF_DEVICE or "auto"),
+            "fp16": _env_flag("HF_FP16", bool(getattr(settings, "HF_FP16", True))),
         },
+
+        
         "chunking": {"child_w": 200, "child_overlap": 35, "parent_w": 800},
         "prompt": {
             "system": (
@@ -164,7 +176,7 @@ def load_config() -> Dict[str, Any]:
 
     base = _load_yaml(DEFAULT_YAML)
     local = _load_yaml(LOCAL_YAML)
-    runtime = load_runtime_overrides()  # ← слой Python-настроек
+    runtime = load_runtime_overrides()
 
     def merge(a: Dict[str, Any], b: Dict[str, Any]) -> Dict[str, Any]:
         out = dict(a)
@@ -175,29 +187,9 @@ def load_config() -> Dict[str, Any]:
                 out[k] = v
         return out
 
-    # Порядок важен: DEFAULTS <- default.yaml <- local.yaml <- runtime_settings.py
     return merge(DEFAULTS, merge(base, merge(local, runtime)))
 
 CONFIG = load_config()
-
-# после CONFIG = load_config()
-
-WARMUP_DONE = False
-
-@app.on_event("startup")
-def warmup_bm25():
-    """Открываем Lucene индекс один раз, чтобы ускорить первые запросы."""
-    global WARMUP_DONE
-    if WARMUP_DONE or os.getenv("BM25_WARMUP_DISABLED") == "1":
-        return
-    try:
-        from rag.bm25_utils import bm25_search
-        idx = cfg("app", "bm25_index_dir", default="index/bm25_idx")
-        bm25_search(idx, "тест", topk=1)  # прогрев JVM + индекса
-        print("🔥 BM25 warmed up")
-        WARMUP_DONE = True
-    except Exception as e:
-        print(f"⚠️ BM25 warmup skipped: {e}")
 
 def cfg(*path: str, default: Any = None) -> Any:
     cur: Any = CONFIG
@@ -229,6 +221,24 @@ def cfg_str(*path, default: str) -> str:
     return str(v) if (v is not None and str(v).strip() != "") else str(default)
 
 # ================================
+# Warmup BM25 (один раз)
+# ================================
+WARMUP_DONE = False
+
+@app.on_event("startup")
+def warmup_bm25():
+    global WARMUP_DONE
+    if WARMUP_DONE or os.getenv("BM25_WARMUP_DISABLED") == "1":
+        return
+    try:
+        idx = settings.BM25_INDEX_DIR
+        bm25_search(idx, "тест", topk=1)  # прогрев JVM + индекса
+        print("🔥 BM25 warmed up")
+        WARMUP_DONE = True
+    except Exception as e:
+        print(f"⚠️ BM25 warmup skipped: {e}")
+
+# ================================
 # Utils
 # ================================
 def looks_meaningless(text: str) -> bool:
@@ -243,21 +253,6 @@ def looks_meaningless(text: str) -> bool:
     if letters_only and len(set(t)) < 5 and len(t) < 20:
         return True
     return False
-
-def load_pages_text(pages_dir: Path, doc_id: str, p_start: int, p_end: int) -> str:
-    jf = pages_dir / f"{doc_id}.pages.jsonl"
-    if not jf.exists():
-        return ""
-    out: List[str] = []
-    for line in jf.read_text(encoding="utf-8", errors="ignore").splitlines():
-        try:
-            rec = json.loads(line)
-            pg = int(rec.get("page", 0))
-            if p_start <= pg <= p_end:
-                out.append(rec.get("text", "") or "")
-        except Exception:
-            continue
-    return "\n".join(out)
 
 def build_context_citations(ctx_items, max_out: int = 5):
     return [f"{it['doc_id']} стр.{it['page_start']}-{it['page_end']}" for it in ctx_items[:max_out]]
@@ -274,7 +269,6 @@ def build_ctx_string(ctx_items, max_chars: int = 8000, per_text_limit: int = 800
     return "".join(parts)
 
 def _approx_tokens(s: str) -> int:
-    # грубо: 1 токен ≈ 4 символа
     return max(1, len(s) // 4)
 
 # ================================
@@ -282,7 +276,7 @@ def _approx_tokens(s: str) -> int:
 # ================================
 def _qdrant_client_rest(url_override: Optional[str] = None):
     from qdrant_client import QdrantClient
-    url = (url_override or cfg("qdrant", "url", default="http://qdrant:6333"))
+    url = (url_override or cfg("qdrant", "url", default=settings.QDRANT_URL))
     if "qdrant:" in url:
         try:
             socket.gethostbyname("qdrant")
@@ -418,7 +412,6 @@ def _ns_to_ms(ns: int) -> int:
         return 0
 
 def _ollama_generate_stream(ollama_url, payload, connect_timeout_s=3.0, read_timeout_s=50.0) -> str:
-    # стрим JSON-объектов построчно; собираем только поле "response"
     with _HTTP.post(
         f"{ollama_url.rstrip('/')}/api/generate",
         json={**payload, "stream": True},
@@ -453,7 +446,6 @@ def call_ollama_json(
     options: Optional[Dict[str, Any]] = None,
     **_ignored_kwargs,
 ) -> Dict[str, Any]:
-    """Вызов Ollama /api/generate с поддержкой таймаутов, стрим-fallback и метрик."""
     import json as _json
     try:
         if not ollama_url:
@@ -466,9 +458,9 @@ def call_ollama_json(
         }
         if options:
             bad = {"gpu_layers", "num_gpu", "main_gpu"}
-            opts.update({k:v for k,v in options.items() if k not in bad})
+            opts.update({k: v for k, v in options.items() if k not in bad})
         if extra_options:
-            opts.update({k:v for k,v in extra_options.items() if k not in bad})
+            opts.update({k: v for k, v in extra_options.items() if k not in bad})
 
         payload = {
             "model": model,
@@ -488,7 +480,6 @@ def call_ollama_json(
             )
             resp.raise_for_status()
         except requests.exceptions.ReadTimeout:
-            # ⬇️ стрим-fallback
             try:
                 print("⏩ switch to streaming fallback")
                 raw_stream = _ollama_generate_stream(
@@ -502,7 +493,6 @@ def call_ollama_json(
             except Exception as e2:
                 return {"score": None, "subscores": {}, "critical_errors": [], "recommendations": [], "citations": [], "disclaimer": f"LLM timeout (stream fallback failed): {e2}"}
 
-        # лог метрик (если не стрим)
         meta_logged = False
         if str(resp.headers.get("content-type", "")).startswith("application/json"):
             obj = resp.json()
@@ -542,15 +532,11 @@ def call_ollama_json(
 class AnalyzeReq(BaseModel):
     case_text: str
     query: Optional[str] = None
-    # k берём с UI, но если пусто/None — поставим дефолт из runtime_settings
     k: Optional[int] = Field(default=None)
     model: str = Field(default_factory=lambda: cfg("ollama", "model", default="llama3.1:8b"))
-    ollama_url: Optional[str] = Field(
-        default_factory=lambda: cfg("ollama", "base_url", default="http://host.docker.internal:11434")
-    )
+    ollama_url: Optional[str] = Field(default_factory=lambda: cfg("ollama", "base_url", default="http://host.docker.internal:11434"))
 
     if _P_V2:
-        # pydantic v2
         @field_validator("k", mode="before")
         def _coerce_k_v2(cls, v):
             if v in (None, "", "null"):
@@ -560,7 +546,6 @@ class AnalyzeReq(BaseModel):
             except Exception:
                 return settings.RETR_TOP_K
     else:
-        # pydantic v1
         @field_validator("k", pre=True)
         def _coerce_k_v1(cls, v):
             if v in (None, "", "null"):
@@ -581,11 +566,11 @@ def _resolve(name: str, default: str) -> str:
 # ================================
 @app.get("/health")
 def health():
-    qdrant_url = _resolve("QDRANT_URL", "http://localhost:7779")
-    collection = _resolve("QDRANT_COLLECTION", "med_kb_v3")
-    emb_backend = os.getenv("EMB_BACKEND") or cfg("embedding", "backend", default="hf")
-    hf_model = os.getenv("HF_MODEL") or cfg("embedding", "model", default="BAAI/bge-m3")
-    device = os.getenv("HF_DEVICE") or cfg("embedding", "device", default="auto")
+    qdrant_url = settings.QDRANT_URL
+    collection = settings.QDRANT_COLLECTION
+    emb_backend = settings.EMB_BACKEND
+    hf_model = settings.HF_MODEL
+    device = settings.HF_DEVICE or "auto"
     return {
         "status": "ok",
         "app_env": os.getenv("APP_ENV", "dev"),
@@ -610,10 +595,10 @@ def debug_config():
             "num_ctx": cfg_int("ollama", "num_ctx", default=6144),
         },
         "qdrant": {
-            "url": cfg_str("qdrant", "url", default="http://qdrant:6333"),
-            "collection": cfg_str("qdrant", "collection", default="med_kb_v3"),
+            "url": settings.QDRANT_URL,
+            "collection": settings.QDRANT_COLLECTION,
         },
-        "retrieval": {"k": cfg_int("retrieval", "k", default=8)},
+        "retrieval": {"k": settings.RETR_TOP_K},
         "chunking": {
             "child_w": cfg_int("chunking", "child_w", default=200),
             "child_overlap": cfg_int("chunking", "child_overlap", default=35),
@@ -624,7 +609,11 @@ def debug_config():
 @app.post("/config/reload")
 def config_reload():
     global CONFIG
-    CONFIG = load_config()  # ← подтянет обновлённый runtime_settings.py
+    CONFIG = load_config()
+    try:
+        settings.apply_env(force=True)
+    except Exception:
+        pass
     return {"status": "reloaded"}
 
 @app.post("/analyze")
@@ -640,7 +629,7 @@ def analyze_ep(req: AnalyzeReq):
                 "disclaimer": "Текст кейса не содержит осмысленных данных.",
             }}
 
-        # --- Поисковый запрос ---
+        # --- Сбор поискового запроса ---
         def _smart_query(case_text: str) -> str:
             m = re.search(r"\b([A-Za-z]\d{1,2}(?:\.\d+)?)\b", case_text)
             if m:
@@ -648,66 +637,35 @@ def analyze_ep(req: AnalyzeReq):
             t = re.sub(r"\s+", " ", (case_text or "")).strip()
             return t[:200]
 
-        
-        # --- Сбор поискового запроса ---
-        # Из тела запроса:
-        diag_query = (getattr(req, "query", "") or "").strip()       # поле с диагнозом/кодом, если пришло
-        user_input_text = (getattr(req, "case_text", "") or "").strip()  # свободный текст кейса
-
+        diag_query = (getattr(req, "query", "") or "").strip()
+        user_input_text = (getattr(req, "case_text", "") or "").strip()
         k = req.k if isinstance(req.k, int) and 0 <= req.k <= 20 else settings.RETR_TOP_K
 
-
-        # Если диагноз не задан — построим запрос из текста кейса (fallback)
         if diag_query:
-            # Используем и диагноз, и текст кейса
             search_q = f"{diag_query}\n{user_input_text[:2000]}".strip() if user_input_text else diag_query
         else:
-            # Нет диагноза: «умный» запрос из текста + сам текст
             base = _smart_query(user_input_text)
             search_q = f"{base}\n{user_input_text[:2000]}".strip() if user_input_text else base
 
         print("🔍 query =", search_q)
 
-        # --- Ретрив ---
-        ctx_items = retrieve_hybrid(
-        search_q,
-        k=settings.RETR_TOP_K,
-        bm25_index_dir=settings.BM25_INDEX_DIR,
-        qdrant_url=settings.QDRANT_URL,
-        qdrant_collection=settings.QDRANT_COLLECTION,
-        pages_dir=settings.PAGES_DIR,
-        hf_model=settings.HF_MODEL,
-        hf_device=settings.HF_DEVICE,
-        hf_fp16=settings.HF_FP16,
-        per_doc_limit=settings.RETR_PER_DOC_LIMIT,
-        reranker_enabled=settings.RERANKER_ENABLED,
-        rerank_top_k=settings.RERANK_TOP_K,
-    )
-
-
-        # --- Извлечение контекста ---
+        # --- Ретрив один раз ---
         t_r0 = time.perf_counter()
         ctx_items = retrieve_hybrid(
-            search_q, req.k,
-            bm25_index_dir = cfg("app", "bm25_index_dir", default="index/bm25_idx"),
-            qdrant_url     = cfg("qdrant", "url",        default="http://qdrant:6333"),
-            qdrant_collection = cfg("qdrant", "collection", default="med_kb_v3"),
-            pages_dir      = cfg("app", "data_dir",      default="data"),
-
-            # эмбеддинги
-            hf_model  = cfg("embedding", "model",  default=os.getenv("HF_MODEL", "BAAI/bge-m3")),
-            hf_device = cfg("embedding", "device", default=os.getenv("HF_DEVICE", "auto")),
-            hf_fp16   = bool(cfg("embedding", "fp16",   default=False)),
-
-            # сколько фрагментов из одного документа максимум
-            per_doc_limit = int(os.getenv("PER_DOC_LIMIT", cfg("app", "per_doc_limit", default=2))),
-
-            # РЕРАНКЕР — берём из runtime_settings
-            reranker_enabled = bool(cfg("reranker", "enabled", default=False)),
-         
-)
-
+            search_q, k,
+            bm25_index_dir=settings.BM25_INDEX_DIR,
+            qdrant_url=settings.QDRANT_URL,
+            qdrant_collection=settings.QDRANT_COLLECTION,
+            pages_dir=settings.PAGES_DIR,
+            hf_model=settings.HF_MODEL,
+            hf_device=settings.HF_DEVICE,
+            hf_fp16=settings.HF_FP16,
+            per_doc_limit=settings.RETR_PER_DOC_LIMIT,
+            reranker_enabled=settings.RERANKER_ENABLED,
+            rerank_top_k=settings.RERANK_TOP_K,
+        )
         t_r1 = time.perf_counter()
+
         if not ctx_items:
             return {"result": {
                 "score": 0, "subscores": {}, "critical_errors": [],
@@ -716,7 +674,7 @@ def analyze_ep(req: AnalyzeReq):
             }}
 
         ctx = build_ctx_string(ctx_items, max_chars=8000, per_text_limit=800)
-        print(f"📏 lengths: case={len(req.case_text)} ctx={len(ctx)} k={req.k}")
+        print(f"📏 lengths: case={len(req.case_text)} ctx={len(ctx)} k={k}")
 
         # --- Промпт ---
         DEFAULT_SYSTEM = (
@@ -731,12 +689,10 @@ def analyze_ep(req: AnalyzeReq):
         user_t = cfg("prompt", "user_template", default=DEFAULT_USER_TPL) or DEFAULT_USER_TPL
         user = user_t.format(case_text=req.case_text, ctx=ctx)
 
-        # ── динамический бюджет контекста (но не выше num_ctx из конфига)
         num_ctx_cap = cfg_int("ollama", "num_ctx", default=6144)
         total_est = _approx_tokens(system) + _approx_tokens(user)
         num_ctx = min(num_ctx_cap, max(3072, total_est + 256))
 
-        # ── параметры «как долго и как много думаем»
         llm_timeout   = cfg_int("ollama", "timeout_s", default=60)
         llm_max_tok   = cfg_int("ollama", "max_tokens", default=2048)
         llm_temp      = cfg_float("ollama", "temperature", default=0.4)
@@ -745,7 +701,7 @@ def analyze_ep(req: AnalyzeReq):
         print(f"🤖 LLM url={req.ollama_url or cfg('ollama','base_url', default='N/A')} "
               f"model={req.model} num_ctx={num_ctx} max_tokens={llm_max_tok} timeout={llm_timeout}s")
 
-        # --- Вызов LLM (попытка 1) ---
+        # --- Вызов LLM ---
         t_l0 = time.perf_counter()
         resp = call_ollama_json(
             req.ollama_url, req.model, system, user,
@@ -767,7 +723,7 @@ def analyze_ep(req: AnalyzeReq):
             )
         timed_out = isinstance(resp, dict) and isinstance(resp.get("disclaimer"), str) and "timeout" in resp["disclaimer"]
 
-        # --- Если таймаут/пусто — fast-retry ---
+        # --- Fast-retry при таймауте/пустоте ---
         if timed_out or _is_empty(data):
             print("⏩ fast-retry: shrinking context and num_predict")
             ctx_small = build_ctx_string(ctx_items[:min(3, len(ctx_items))], max_chars=6000, per_text_limit=700)
@@ -877,7 +833,6 @@ textarea{min-height:180px}
         <label>Модель / K</label>
         <div class="row" style="grid-template-columns:2fr 1fr;gap:8px">
           <select id="model"><option>llama3.1:8b</option><option>llama3.1:70b</option></select>
-          <!-- value пустой: если оставить пустым — сервер возьмёт дефолт из runtime_settings -->
           <input id="k" type="number" value="" min="0" max="20" placeholder="по умолч.">
         </div>
         <div class="help">Оставьте K пустым — возьмётся значение из настроек сервера</div>
@@ -961,7 +916,6 @@ async function run(){
       model:     el('model').value || 'llama3.1:8b'
     };
 
-    // k: отправляем только если введено число
     const kRaw = (el('k').value || '').trim();
     if (kRaw !== '') {
       const kParsed = parseInt(kRaw, 10);
@@ -1023,7 +977,6 @@ setInterval(checkReindexStatus, 3000);
 </script>
 """
 
-
 @app.get("/", response_class=HTMLResponse)
 def ui_root():
     return HTMLResponse(UI_HTML)
@@ -1044,7 +997,6 @@ def runtime_defaults():
 
 @app.get("/reindex/status")
 def reindex_status():
-    # всегда объект, чтобы фронт не падал
     return index_status
 
 def run_reindex(*, full: bool = False):
@@ -1053,6 +1005,13 @@ def run_reindex(*, full: bool = False):
     import socket as _socket
     import subprocess as _subprocess
     from pathlib import Path
+
+    # Продавим значения из runtime_settings.CONTROL в окружение,
+    # чтобы они стали источником правды для всех подпроцессов.
+    try:
+        settings.apply_env(force=True)
+    except Exception:
+        pass
 
     global index_status
 
@@ -1063,8 +1022,7 @@ def run_reindex(*, full: bool = False):
     build_bm25_py = str(base / "build_bm25.py")
     chunk_and_index_py = str(base / "chunk_and_index.py")
 
-
-    # --- helpers ---
+    # ---------- helpers ----------
     def _nz(val, default):
         s = (val or "").strip() if isinstance(val, str) else val
         return s if s not in (None, "", "None") else default
@@ -1087,8 +1045,9 @@ def run_reindex(*, full: bool = False):
             return "http://localhost:7779"
         return url
 
-    # штамп свежести BM25
+    # --- штамп свежести BM25 ---
     STAMP_BM25 = Path("index/.bm25_last_build")
+
     def _latest_pages_mtime() -> float:
         pages = list(Path("data").glob("*.pages.jsonl"))
         return max((p.stat().st_mtime for p in pages), default=0.0)
@@ -1109,57 +1068,64 @@ def run_reindex(*, full: bool = False):
         env = _os.environ.copy()
         env["QDRANT__PREFER_GRPC"] = "false"
 
-        # --- Шаг 1: Ingest (всегда) ---
+        # --- Шаг 1: Ingest ---
         index_status.update({"state": "running", "message": "📄 Шаг 1: парсинг RAW → JSONL (инкрементально)..."})
         print("▶️ ingest_from_raw.py ...")
 
         cmd_ingest = ["python", ingest_py, "--input-dir", raw_dir, "--out-dir", data_dir]
 
-        # полный прогон по запросу ИЛИ при пустом манифесте
         man = Path(data_dir) / "manifest.json"
-        first_run = not man.exists() or not json.loads(man.read_text(encoding="utf-8") or "{}").get("docs")
+        try:
+            first_run = not man.exists() or not (json.loads(man.read_text(encoding="utf-8") or "{}").get("docs") or [])
+        except Exception:
+            first_run = True
+
         if full or first_run:
             cmd_ingest.append("--force")
 
         _subprocess.run(cmd_ingest, check=True, env=env)
 
-
-        # --- Резолв параметров для следующих шагов ---
+        # --- Резолв параметров (всё через env, выставленное settings.apply_env) ---
         qdrant_url = _normalize_qdrant_url(
-            _nz(_os.getenv("QDRANT_URL") or cfg("qdrant", "url", default="http://qdrant:6333"),
-                "http://localhost:7779")
+            _nz(_os.getenv("QDRANT_URL") or cfg("qdrant", "url", default=settings.QDRANT_URL),
+                settings.QDRANT_URL)
         )
-        collection = _nz(_os.getenv("QDRANT_COLLECTION") or cfg("qdrant", "collection", default="med_kb_v3"), "med_kb_v3")
-        emb_backend = _nz(_os.getenv("EMB_BACKEND") or cfg("embedding", "backend", default="hf"), "hf")
-        hf_model = _nz(
-            _os.getenv("HF_MODEL") or
-            cfg("embedding", "hf_model", default=cfg("embedding", "model", default="BAAI/bge-m3")),
-            "BAAI/bge-m3"
-        )
+        collection  = _nz(_os.getenv("QDRANT_COLLECTION") or cfg("qdrant", "collection", default=settings.QDRANT_COLLECTION),
+                          settings.QDRANT_COLLECTION)
+        emb_backend = _nz(_os.getenv("EMB_BACKEND") or cfg("embedding", "backend", default=settings.EMB_BACKEND), "hf")
+        hf_model    = _nz(_os.getenv("HF_MODEL") or cfg("embedding", "model", default=settings.HF_MODEL), settings.HF_MODEL)
 
+        # Dense-чанкинг
         child_w       = _as_int(_os.getenv("CHILD_W"),       cfg("chunking", "child_w",       default=200))
         child_overlap = _as_int(_os.getenv("CHILD_OVERLAP"), cfg("chunking", "child_overlap", default=35))
         parent_w      = _as_int(_os.getenv("PARENT_W"),      cfg("chunking", "parent_w",      default=800))
+
+        # BM25-чанкинг/язык (управляется runtime_settings через ENV)
+        bm25_child_w  = _as_int(_os.getenv("BM25_CHILD_W"),         _as_int(_os.getenv("CHILD_W"), 200))
+        bm25_overlap  = _as_int(_os.getenv("BM25_CHILD_OVERLAP"),   _as_int(_os.getenv("CHILD_OVERLAP"), 40))
+        bm25_lang     = _nz(_os.getenv("BM25_LANGUAGE"),            "ru")
 
         print(
             "🔧 RESOLVED → "
             f"QDRANT_URL={qdrant_url}  QDRANT_COLLECTION={collection}  "
             f"EMB_BACKEND={emb_backend}  HF_MODEL={hf_model}  "
-            f"child_w={child_w} child_overlap={child_overlap} parent_w={parent_w}"
+            f"child_w={child_w} child_overlap={child_overlap} parent_w={parent_w}  "
+            f"[BM25 child_w={bm25_child_w} overlap={bm25_overlap} lang={bm25_lang}]"
         )
 
-        # --- Шаг 2: BM25 (только при необходимости или при full) ---
+        # --- Шаг 2: BM25 ---
         if full or _bm25_needs_rebuild():
             index_status["message"] = "📚 Шаг 2: построение/обновление BM25 индекса..."
             print("▶️ build_bm25.py ...")
             _subprocess.run(
                 [
-                    "python", "build_bm25.py",
+                    "python", build_bm25_py,
                     "--pages-glob", "data/*.pages.jsonl",
                     "--out-json",   "index/bm25_json",
                     "--index-dir",  "index/bm25_idx",
-                    # если добавишь в build_bm25.py инкрементальный режим, сюда можно докинуть флаг:
-                    # "--only-new",
+                    "--child-w",    str(bm25_child_w),
+                    "--child-overlap", str(bm25_overlap),
+                    "--language",   bm25_lang,
                 ],
                 check=True, env=env
             )
@@ -1171,13 +1137,13 @@ def run_reindex(*, full: bool = False):
         # --- Шаг 3: Dense → Qdrant ---
         index_status["message"] = "🧠 Шаг 3: индексация в Qdrant (dense)..."
         cmd_qdr = [
-            "python", "chunk_and_index.py",
+            "python", chunk_and_index_py,
             "--pages-glob",    "data/*.pages.jsonl",
             "--collection",    collection,
             "--qdrant-url",    qdrant_url,
             "--emb-backend",   emb_backend,
             "--hf-model",      hf_model,
-            "--batch",         "512",
+            "--batch",         "128",
             "--child-w",       str(child_w),
             "--child-overlap", str(child_overlap),
             "--parent-w",      str(parent_w),
@@ -1198,6 +1164,5 @@ def run_reindex(*, full: bool = False):
 
 @app.post("/reindex")
 def reindex_ep(full: bool = False):
-    # Запускаем в фоне и ВСЕГДА возвращаем объект с message
     threading.Thread(target=run_reindex, kwargs={"full": bool(full)}, daemon=True).start()
     return {"status": "started", "message": "Индексация запущена", "full": bool(full)}
