@@ -11,6 +11,7 @@ RAW (PDF/DOCX/TXT) -> data/*.pages.jsonl + data/manifest.json
 - EasyOCR: «тёплый старт» для скачивания моделей один раз; в воркерах скачивание отключено.
 - GPU-настройки для EasyOCR: можно принудительно задать устройство (--ocr-gpu cuda|cpu|auto),
   путь к кэшу моделей и возможность скачивания (--easyocr-allow-downloads).
+- ✂️ АНТИ-ЛИТЕРАТУРА: автоматически вырезаем разделы «Список литературы / References».
 
 Зависимости (в контейнере app):
   pip install chardet pymupdf pillow python-docx
@@ -126,10 +127,35 @@ def clean_text(text: str) -> str:
     t = t.translate(_LATIN_TO_CYR)                           # частые замены латиницы на кириллицу
     return t.strip()
 
+# --- детектор «Списка литературы» / References ---
+REFS_HDR_RE = re.compile(
+    r'^\s*(?:'
+    r'спис[оo]к\s+литератур[аы]|литератур[аы]|источники|'
+    r'использованн[а-яё]+\s+литератур[аы]|'
+    r'references?|bibliograph\w*'
+    r')\s*[:\-–—]?\s*$',
+    re.IGNORECASE | re.MULTILINE
+)
+
+def strip_tail_references(text: str) -> tuple[str, bool]:
+    """
+    Найти заголовок библиографии и обрезать всё, что идёт после него.
+    Возвращает (новый_текст, было_ли_обрезание).
+    """
+    if not text:
+        return text, False
+    m = REFS_HDR_RE.search(text)
+    if not m:
+        return text, False
+    return text[:m.start()].rstrip(), True
+
 
 def split_text_to_pages(full_text: str, page_size_chars: int = 1800) -> List[Dict[str, Any]]:
     """Нарезаем длинный текст на «псевдо-страницы» по символам, стараясь уважать абзацы."""
     text = clean_text(full_text)
+    # попытка обрезать литературу и для текстов/доксов
+    text, _ = strip_tail_references(text)
+
     if not text:
         return [{"page": 1, "text": ""}]
 
@@ -192,6 +218,8 @@ def ingest_docx(path: Path, page_size_chars: int = 1800) -> List[Dict[str, Any]]
     raw = extract_docx_text(path)
     if not raw:
         return [{"page": 1, "text": ""}]
+    # ✂️ обрезаем литературу до нарезки
+    raw, _ = strip_tail_references(raw)
     return split_text_to_pages(raw, page_size_chars=page_size_chars)
 
 
@@ -255,6 +283,7 @@ def ingest_pdf(
         print(f"[WARN] Не удалось открыть PDF {pdf_path.name}: {e}", file=sys.stderr, flush=True)
         return pages
 
+    # как только встретили заголовок «Литература/References» — обрежем и остановимся
     for i, page in enumerate(doc, start=1):
         txt = (page.get_text("text") or "").strip()
 
@@ -294,16 +323,36 @@ def ingest_pdf(
             elif verbose and ocr_mode != "never" and txt_ocr:
                 print(f"[OCR-{ocr_backend}] {pdf_path.name} p.{i}: OCR не улучшил текст (len={len(txt)})", flush=True)
 
+        # ✂️ сначала пробуем обрезать до чистки
+        if txt:
+            txt_cut, cut0 = strip_tail_references(txt)
+            if cut0:
+                txt = txt_cut
+
         if txt:
             txt = clean_text(txt)
 
+        # ✂️ ещё раз пробуем после clean_text (на случай OCR-«каши» в заголовке)
+        if txt:
+            txt_cut2, cut1 = strip_tail_references(txt)
+            if cut1:
+                txt = txt_cut2
+
         pages.append({"page": i, "text": txt})
+
+        # если был срез «литературы» на этой странице — прекращаем разбор следующих страниц
+        if ('cut0' in locals() and cut0) or ('cut1' in locals() and cut1):
+            if verbose:
+                print(f"[CUT] {pdf_path.name}: обнаружен раздел литературы на странице {i}, дальнейшие страницы пропущены", flush=True)
+            break
 
     return pages
 
 
 def ingest_txt(txt_path: Path, page_size_chars: int = 1800) -> List[Dict[str, Any]]:
     text = detect_text_file(txt_path).strip()
+    # ✂️ отрезаем литературу
+    text, _ = strip_tail_references(text)
     return split_text_to_pages(text, page_size_chars=page_size_chars)
 
 

@@ -63,9 +63,9 @@ CONTROL: Dict[str, Any] = {
             "gpu_layers": -1, "keep_alive": "30m"
         },
         "deepseek-r1:32b": {
-            "num_ctx": 8192, "max_tokens": 600, "timeout_s": 180,
-            "temperature": 0.1, "top_p": 0.90, "repeat_penalty": 1.05,
-            "gpu_layers": -1, "keep_alive": "30m"
+            "num_ctx": 12288, "max_tokens": 800, "timeout_s": 180,
+            "temperature": 0.3, "top_p": 0.90, "repeat_penalty": 1.05,
+            "gpu_layers": -1, "keep_alive": "60m"
         },
     },
 
@@ -104,9 +104,9 @@ CONTROL: Dict[str, Any] = {
     "LLM_BASE_URL": "http://ollama:11434",
 
     # Retrieval
-    "RETR_TOP_K": 4,
+    "RETR_TOP_K": 8,
     "RETR_PER_DOC_LIMIT": 1,
-    "CTX_SNIPPET_LIMIT": 400,  # сколько символов контекста отдавать в LLM
+    "CTX_SNIPPET_LIMIT": 4000,  # сколько символов контекста отдавать в LLM
 
     # Paths & indexes
     "PAGES_DIR": "data",
@@ -123,7 +123,7 @@ CONTROL: Dict[str, Any] = {
 
     # Reranker
     "RERANKER_ENABLED": True,
-    "RERANK_TOP_K": 20,
+    "RERANK_TOP_K": 50,
     "RERANKER_MODEL": "BAAI/bge-reranker-v2-m3",
 
     # EasyOCR
