@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+from config.runtime_settings import settings
+
 
 import json
 import os
@@ -69,6 +71,56 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"]
 )
 
+# [api_app.py] — положи это рядом с остальными вспомогательными функциями
+def _as_int(v, default):
+    try:
+        return int(str(v))
+    except Exception:
+        return default
+
+def _as_float(v, default):
+    try:
+        return float(str(v))
+    except Exception:
+        return default
+
+def _llm_conf_from_settings() -> dict:
+    """
+    Централизованная конфигурация вызова LLM.
+    Источники приоритезированы: ENV > settings > дефолт.
+    Гарантирует наличие всех ключей, чтобы не было KeyError.
+    """
+    # базовые дефолты
+    d_model       = getattr(settings, "LLM_MODEL", "llama3.1:8b")
+    d_base_url    = getattr(settings, "LLM_BASE_URL", "http://host.docker.internal:11434")
+    d_num_ctx     = getattr(settings, "LLM_NUM_CTX", 4096)
+    d_max_tokens  = getattr(settings, "LLM_MAX_TOKENS", 300)
+    d_timeout_s   = getattr(settings, "LLM_TIMEOUT", 60)
+    d_temp        = 0.4
+    d_top_p       = 0.95
+    d_repeat_pen  = 1.05
+    d_gpu_layers  = -1
+    d_keep_alive  = "30m"
+
+    conf = {
+        "model":        os.getenv("LLM_MODEL", d_model),
+        "base_url":     os.getenv("LLM_BASE_URL", d_base_url),
+
+        # лимиты
+        "num_ctx_cap":  _as_int(os.getenv("LLM_NUM_CTX"), d_num_ctx),
+        "max_tokens":   _as_int(os.getenv("LLM_MAX_TOKENS"), d_max_tokens),
+        "timeout_s":    _as_int(os.getenv("LLM_TIMEOUT"), d_timeout_s),
+
+        # сэмплинг
+        "temperature":      _as_float(os.getenv("LLM_TEMPERATURE"), d_temp),
+        "top_p":            _as_float(os.getenv("LLM_TOP_P"), d_top_p),
+        "repeat_penalty":   _as_float(os.getenv("LLM_REPEAT_PENALTY"), d_repeat_pen),
+
+        # GPU/сеанс
+        "gpu_layers":   _as_int(os.getenv("LLM_NUM_GPU_LAYERS"), d_gpu_layers),
+        "keep_alive":   os.getenv("LLM_KEEP_ALIVE", d_keep_alive),
+    }
+    return conf
 # ================================
 # Config (yaml + runtime overrides)
 # ================================
@@ -78,6 +130,7 @@ print(f"📂 CWD set to: {Path.cwd()}")
 CONF_DIR = ROOT / "config"
 DEFAULT_YAML = CONF_DIR / "default.yaml"
 LOCAL_YAML = CONF_DIR / "local.yaml"
+
 
 def load_runtime_overrides() -> Dict[str, Any]:
     """Подхватывает config/runtime_settings.py (dict RUNTIME), можно менять без пересборки."""
@@ -411,12 +464,62 @@ def _ns_to_ms(ns: int) -> int:
     except Exception:
         return 0
 
-def _ollama_generate_stream(ollama_url, payload, connect_timeout_s=3.0, read_timeout_s=50.0) -> str:
+# --- Ollama HTTP helpers (stream-first) ---
+
+# --- Ollama HTTP helpers: stream-first, no JSON format on stream ---
+
+# == ollama_io.py == (или где у тебя живут эти функции)
+import json
+import requests
+from typing import Optional, Dict, Any
+
+# общий http-сесс
+_HTTP = requests.Session()
+
+def _trim_code_fences(s: str) -> str:
+    s = (s or "").strip()
+    if s.startswith("```"):
+        s = s.strip("` \n")
+        # убираем возможный префикс типа json
+        s = s.split("\n", 1)[-1]
+    return s.strip()
+
+def safe_json_extract(s: str) -> Dict[str, Any]:
+    s = _trim_code_fences(s)
+    try:
+        obj = json.loads(s)
+        if isinstance(obj, dict):
+            return obj
+        # если список – завернём в объект
+        return {"result": obj}
+    except Exception:
+        # вернём «обёртку» с дисклеймером, чтобы не падать
+        return {"score": None, "subscores": {}, "critical_errors": [], "recommendations": [], "citations": [],
+                "disclaimer": "LLM вернул не-JSON (stream relax)."}
+
+def _ollama_generate_stream(
+    ollama_url: str,
+    payload: Dict[str, Any],
+    *,
+    per_chunk_timeout_s: float = 30.0,
+    connect_timeout_s: float = 3.0,
+    enforce_json_on_stream: bool = False,
+) -> str:
+    """
+    Стримим токены. ВНИМАНИЕ: по умолчанию НЕ ставим format=json на стриме,
+    чтобы не ждать «целый JSON» и получать токены сразу.
+    """
+    # Готовим payload ДЛЯ СТРИМА: УБИРАЕМ format, если не требуется жёсткая валидация.
+    stream_payload = dict(payload)
+    stream_payload["stream"] = True
+    if not enforce_json_on_stream and "format" in stream_payload:
+        stream_payload.pop("format", None)
+
     with _HTTP.post(
         f"{ollama_url.rstrip('/')}/api/generate",
-        json={**payload, "stream": True},
-        timeout=(float(connect_timeout_s), float(read_timeout_s)),
-        stream=True
+        json=stream_payload,
+        timeout=(float(connect_timeout_s), float(per_chunk_timeout_s)),
+        stream=True,
     ) as r:
         r.raise_for_status()
         buf = []
@@ -425,11 +528,15 @@ def _ollama_generate_stream(ollama_url, payload, connect_timeout_s=3.0, read_tim
                 continue
             try:
                 chunk = json.loads(ln)
-                if "response" in chunk:
+                # Стандартный формат Ollama stream: {"response": "..." , "done": false}
+                if "response" in chunk and chunk["response"]:
                     buf.append(chunk["response"])
+                # можно логировать «первый токен» для диагностики латентности
             except Exception:
+                # если прилетело что-то не JSON (редко) — просто пропускаем
                 continue
         return "".join(buf)
+
 
 def call_ollama_json(
     ollama_url: Optional[str],
@@ -438,93 +545,106 @@ def call_ollama_json(
     user_prompt: str,
     *,
     connect_timeout_s: float = 3.0,
-    read_timeout_s: float = 50.0,
+    read_timeout_s: float = 90.0,
+    stream_chunk_timeout_s: float = 30.0,
     num_ctx: int = 6144,
     num_predict: int = 160,
     temperature: float = 0.2,
     extra_options: Optional[Dict[str, Any]] = None,
     options: Optional[Dict[str, Any]] = None,
+    keep_alive: Optional[str] = None,
     **_ignored_kwargs,
 ) -> Dict[str, Any]:
-    import json as _json
+    """
+    1) Пытаемся стримить БЕЗ format=json (быстрое появление токенов).
+    2) Если таймаут/ошибка — делаем короткую блокирующую попытку с format=json.
+    """
     try:
         if not ollama_url:
-            ollama_url = cfg("ollama", "base_url", default="http://host.docker.internal:11434") or "http://host.docker.internal:11434"
+            # твой дефолт, как раньше
+            ollama_url = "http://host.docker.internal:11434"
 
+        # собираем options (фильтруем «опасные» ключи)
+        bad = {"gpu_layers", "num_gpu", "main_gpu"}  # мы сами явно пробрасываем gpu_layers, если надо
         opts = {
             "num_ctx": int(num_ctx),
             "num_predict": int(num_predict),
             "temperature": float(temperature),
         }
         if options:
-            bad = {"gpu_layers", "num_gpu", "main_gpu"}
             opts.update({k: v for k, v in options.items() if k not in bad})
         if extra_options:
             opts.update({k: v for k, v in extra_options.items() if k not in bad})
 
-        payload = {
+        base_payload = {
             "model": model,
             "prompt": user_prompt,
             "system": system_prompt,
-            "format": "json",
+            # ВНИМАНИЕ: format='json' НЕ ставим на стриме; добавим только в блокирующей попытке
             "options": opts,
-            "keep_alive": -1,
-            "stream": False,
         }
+        if keep_alive is not None:
+            base_payload["keep_alive"] = keep_alive
 
+        # --- 1) STREAM-FIRST (без format=json) ---
+        try:
+            print("LLM STREAM: start")
+            text = _ollama_generate_stream(
+                ollama_url,
+                base_payload,
+                per_chunk_timeout_s=stream_chunk_timeout_s,
+                connect_timeout_s=connect_timeout_s,
+                enforce_json_on_stream=False,  # критично
+            )
+            text = _trim_code_fences(text)
+            if text:
+                # Пытаемся распарсить как JSON — если не выйдет, safe_json_extract вернёт вежливую обёртку.
+                return safe_json_extract(text)
+            else:
+                print("LLM STREAM: empty stream result")
+        except requests.exceptions.ReadTimeout:
+            print(f"LLM STREAM: ReadTimeout (chunk {stream_chunk_timeout_s}s), fallback to short blocking call")
+        except Exception as e:
+            print(f"LLM STREAM: error={type(e).__name__}: {e}, fallback to blocking")
+
+        # --- 2) Блокирующая короткая попытка c format=json ---
+        short_payload = dict(base_payload)
+        short_opts = dict(opts)
+        # сильно ужмём длину предсказания, чтобы не ждать
+        short_opts["num_predict"] = min(80, int(opts.get("num_predict", 120)))
+        short_payload["options"] = short_opts
+        short_payload["format"] = "json"  # тут уже можно требовать «валидный JSON» целиком
         try:
             resp = _HTTP.post(
                 f"{ollama_url.rstrip('/')}/api/generate",
-                json=payload,
+                json=short_payload,
                 timeout=(float(connect_timeout_s), float(read_timeout_s)),
             )
             resp.raise_for_status()
-        except requests.exceptions.ReadTimeout:
-            try:
-                print("⏩ switch to streaming fallback")
-                raw_stream = _ollama_generate_stream(
-                    ollama_url, payload,
-                    connect_timeout_s=connect_timeout_s, read_timeout_s=read_timeout_s
-                )
-                raw_stream = _trim_code_fences(raw_stream or "")
-                if not raw_stream:
-                    return {"score": None, "subscores": {}, "critical_errors": [], "recommendations": [], "citations": [], "disclaimer": f"LLM timeout: чтение >{read_timeout_s} с. (stream fallback empty)"}
-                return safe_json_extract(raw_stream)
-            except Exception as e2:
-                return {"score": None, "subscores": {}, "critical_errors": [], "recommendations": [], "citations": [], "disclaimer": f"LLM timeout (stream fallback failed): {e2}"}
-
-        meta_logged = False
-        if str(resp.headers.get("content-type", "")).startswith("application/json"):
-            obj = resp.json()
-            if isinstance(obj, dict):
-                meta = {
-                    "load_ms":   _ns_to_ms(obj.get("load_duration", 0)),
-                    "prompt_ms": _ns_to_ms(obj.get("prompt_eval_duration", 0)),
-                    "gen_ms":    _ns_to_ms(obj.get("eval_duration", 0)),
-                    "total_ms":  _ns_to_ms(obj.get("total_duration", 0)),
-                    "prompt_tok": obj.get("prompt_eval_count"),
-                    "gen_tok":    obj.get("eval_count"),
-                }
-                print(f"🧪 OLLAMA META: {meta}")
-                response_field = obj.get("response", "")
-                meta_logged = True
+            if str(resp.headers.get("content-type", "")).startswith("application/json"):
+                obj = resp.json()
+                # Ответ Ollama в blocking режиме: {"response": "<строка>", "done": true, ...}
+                s = obj.get("response", "") if isinstance(obj, dict) else ""
             else:
-                response_field = ""
-        else:
-            response_field = resp.text or ""
-
-        raw = _json.dumps(response_field, ensure_ascii=False) if isinstance(response_field, (dict, list)) else f"{response_field}".strip()
-        if not raw:
-            return {"score": None, "subscores": {}, "critical_errors": [], "recommendations": [], "citations": [], "disclaimer": "LLM вернул пустой ответ."}
-        if not meta_logged:
-            print("🧪 OLLAMA META: (no meta in response headers)")
-        raw = _trim_code_fences(raw)
-        return safe_json_extract(raw)
+                s = resp.text or ""
+            s = _trim_code_fences(s)
+            if not s:
+                return {"score": None, "subscores": {}, "critical_errors": [], "recommendations": [], "citations": [],
+                        "disclaimer": "LLM вернул пустой ответ (blocking fallback)."}
+            return safe_json_extract(s)
+        except requests.exceptions.ReadTimeout as e:
+            return {"score": None, "subscores": {}, "critical_errors": [], "recommendations": [], "citations": [],
+                    "disclaimer": f"LLM timeout: {e} (blocking fallback)"}
+        except Exception as e:
+            return {"score": None, "subscores": {}, "critical_errors": [], "recommendations": [], "citations": [],
+                    "disclaimer": f"Ошибка LLM ({type(e).__name__}): {e}"}
 
     except requests.exceptions.ConnectTimeout:
-        return {"score": None, "subscores": {}, "critical_errors": [], "recommendations": [], "citations": [], "disclaimer": f"LLM timeout: соединение >{connect_timeout_s} с."}
+        return {"score": None, "subscores": {}, "critical_errors": [], "recommendations": [], "citations": [],
+                "disclaimer": f"LLM timeout: соединение >{connect_timeout_s} c."}
     except Exception as e:
-        return {"score": None, "subscores": {}, "critical_errors": [], "recommendations": [], "citations": [], "disclaimer": f"Ошибка LLM ({type(e).__name__}): {e}"}
+        return {"score": None, "subscores": {}, "critical_errors": [], "recommendations": [], "citations": [],
+                "disclaimer": f"Ошибка LLM ({type(e).__name__}): {e}"}
 
 # ================================
 # API models
@@ -616,11 +736,56 @@ def config_reload():
         pass
     return {"status": "reloaded"}
 
+def _compact_case_text(txt: str, target_chars: int = 1400) -> str:
+    if not txt:
+        return ""
+    t = txt
+
+    # Нормализация пробелов/переводов
+    t = re.sub(r"[ \t]+", " ", t)
+    t = re.sub(r"\n{3,}", "\n\n", t).strip()
+
+    # Убираем часто повторяющиеся отрицания/штампы
+    t = re.sub(r"\b(отрицает|не\s+обнаружено|не\s+находился|не\s+отягощен)\b[.,;:\s]*", "нет. ", t, flags=re.IGNORECASE)
+    t = re.sub(r"\b(безболезненная|кожа обычной окраски|умеренно влажная|свободн\w*|по средней линии)\b[.,;:\s]*", "", t, flags=re.IGNORECASE)
+
+    # Сжимаем длинные числовые хвосты/повторы пунктуации
+    t = re.sub(r"[.;:,]\s*(?:[.;:,]\s*)+", ". ", t)
+    t = re.sub(r"\s{2,}", " ", t)
+
+    # Грубая дедупликация предложений
+    seen = set()
+    out = []
+    for sent in re.split(r"(?<=[.!?])\s+", t):
+        s = sent.strip()
+        key = re.sub(r"\W+", "", s.lower())
+        if len(key) < 5:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(s)
+    t = " ".join(out)
+
+    # Урізаем до целевого окна, но стараемся не резать посреди предложения
+    if len(t) > target_chars:
+        cut = t[:target_chars]
+        last_dot = cut.rfind(".")
+        if last_dot > target_chars * 0.6:
+            t = cut[:last_dot+1]
+        else:
+            t = cut
+
+    return t.strip()
+
 @app.post("/analyze")
 def analyze_ep(req: AnalyzeReq):
     try:
         print("🚀 /analyze")
+        import os, json, time, re
         t0 = time.perf_counter()
+        # таймеры безопасно инициализируем
+        t_r0 = t_r1 = t_l0 = t_l1 = t0
 
         if looks_meaningless(req.case_text):
             return {"result": {
@@ -642,14 +807,14 @@ def analyze_ep(req: AnalyzeReq):
         k = req.k if isinstance(req.k, int) and 0 <= req.k <= 20 else settings.RETR_TOP_K
 
         if diag_query:
-            search_q = f"{diag_query}\n{user_input_text[:2000]}".strip() if user_input_text else diag_query
+            search_q = f"{diag_query}\n{user_input_text[:10000]}".strip() if user_input_text else diag_query
         else:
             base = _smart_query(user_input_text)
-            search_q = f"{base}\n{user_input_text[:2000]}".strip() if user_input_text else base
+            search_q = f"{base}\n{user_input_text[:10000]}".strip() if user_input_text else base
 
         print("🔍 query =", search_q)
 
-        # --- Ретрив один раз ---
+        # --- Ретрив ---
         t_r0 = time.perf_counter()
         ctx_items = retrieve_hybrid(
             search_q, k,
@@ -673,7 +838,11 @@ def analyze_ep(req: AnalyzeReq):
                 "disclaimer": "Контекст не найден в базе знаний — невозможно оценить кейс.",
             }}
 
-        ctx = build_ctx_string(ctx_items, max_chars=8000, per_text_limit=800)
+        ctx = build_ctx_string(
+            ctx_items,
+            max_chars=min(6000, settings.LLM_NUM_CTX * 3),  # общий «потолок» контекста (≈3 симв/токен)
+            per_text_limit=settings.CTX_SNIPPET_LIMIT       # берём из runtime_settings.py
+        )
         print(f"📏 lengths: case={len(req.case_text)} ctx={len(ctx)} k={k}")
 
         # --- Промпт ---
@@ -689,28 +858,55 @@ def analyze_ep(req: AnalyzeReq):
         user_t = cfg("prompt", "user_template", default=DEFAULT_USER_TPL) or DEFAULT_USER_TPL
         user = user_t.format(case_text=req.case_text, ctx=ctx)
 
-        num_ctx_cap = cfg_int("ollama", "num_ctx", default=6144)
+        # --- LLM-параметры из централизованных настроек ---
+        conf = _llm_conf_from_settings()
         total_est = _approx_tokens(system) + _approx_tokens(user)
-        num_ctx = min(num_ctx_cap, max(3072, total_est + 256))
 
-        llm_timeout   = cfg_int("ollama", "timeout_s", default=60)
-        llm_max_tok   = cfg_int("ollama", "max_tokens", default=2048)
-        llm_temp      = cfg_float("ollama", "temperature", default=0.4)
-        llm_top_p     = cfg_float("ollama", "top_p", default=0.95)
+        num_ctx_cap   = int(conf["num_ctx_cap"])               # напр., 16384
+        min_ctx_env   = int(os.getenv("LLM_MIN_CTX", "4096"))  # даём управлять через ENV
+        ctx_margin    = int(os.getenv("LLM_CTX_MARGIN", "768"))
 
-        print(f"🤖 LLM url={req.ollama_url or cfg('ollama','base_url', default='N/A')} "
-              f"model={req.model} num_ctx={num_ctx} max_tokens={llm_max_tok} timeout={llm_timeout}s")
+        MIN_CTX = min(num_ctx_cap, max(1024, min_ctx_env))
+        num_ctx = max(MIN_CTX, min(num_ctx_cap, total_est + ctx_margin))
 
-        # --- Вызов LLM ---
+        print(
+            f"🤖 LLM url={req.ollama_url or cfg('ollama','base_url', default='N/A')} "
+            f"model={req.model} used_ctx={num_ctx} cap_ctx={num_ctx_cap} "
+            f"min_ctx={MIN_CTX} max_tokens={conf['max_tokens']} timeout={conf['timeout_s']}s"
+        )
+        # лог полезной части payload
+        _sanitized = {
+            "model": req.model,
+            "options": {
+                "num_ctx": num_ctx,
+                "num_predict": conf["max_tokens"],
+                "temperature": conf["temperature"],
+                "top_p": conf["top_p"],
+                "repeat_penalty": conf["repeat_penalty"],
+                "num_gpu_layers": conf["gpu_layers"],
+            },
+            "keep_alive": conf["keep_alive"],
+        }
+        print("LLM PAYLOAD (sanitized):", json.dumps(_sanitized, ensure_ascii=False))
+
+        # --- Вызов LLM (стрим по умолчанию — см. Patch 2) ---
         t_l0 = time.perf_counter()
         resp = call_ollama_json(
             req.ollama_url, req.model, system, user,
-            read_timeout_s=float(llm_timeout),
+            read_timeout_s=float(conf["timeout_s"]),
             num_ctx=num_ctx,
-            num_predict=int(llm_max_tok),
-            temperature=float(llm_temp),
-            options={"top_p": float(llm_top_p), "repeat_penalty": 1.05},
+            num_predict=int(conf["max_tokens"]),
+            temperature=float(conf["temperature"]),
+            options={
+                "top_p": float(conf["top_p"]),
+                "repeat_penalty": float(conf["repeat_penalty"]),
+                "num_gpu_layers": int(conf["gpu_layers"]) if conf["gpu_layers"] is not None else -1,
+            },
+            keep_alive=conf["keep_alive"],
+            force_stream=True,                                  # стрим сразу
+            per_chunk_timeout_s=float(settings.LLM_STREAM_CHUNK_TIMEOUT),  # таймаут «тишины» между чанками
         )
+
         data = normalize_result(resp)
         t_l1 = time.perf_counter()
 
@@ -726,23 +922,43 @@ def analyze_ep(req: AnalyzeReq):
         # --- Fast-retry при таймауте/пустоте ---
         if timed_out or _is_empty(data):
             print("⏩ fast-retry: shrinking context and num_predict")
-            ctx_small = build_ctx_string(ctx_items[:min(3, len(ctx_items))], max_chars=6000, per_text_limit=700)
-            user_small = user_t.format(case_text=req.case_text, ctx=ctx_small)
-            total_est_small = _approx_tokens(system) + _approx_tokens(user_small)
-            num_ctx_small = min(num_ctx_cap, max(3072, total_est_small + 128))
-            retry_tokens = min(60, llm_max_tok)
 
+            ctx_small = build_ctx_string(
+                ctx_items[:min(3, len(ctx_items))],
+                max_chars=6000,
+                per_text_limit=700
+            )
+            user_small = user_t.format(case_text=req.case_text, ctx=ctx_small)
+
+            total_est_small = _approx_tokens(system) + _approx_tokens(user_small)
+            num_ctx_small = min(num_ctx_cap, max(1024, total_est_small + 128))
+            retry_tokens = min(60, conf["max_tokens"])
+
+            retry_opts = {
+                "top_p": float(conf["top_p"]),
+                "repeat_penalty": float(conf["repeat_penalty"]),
+            }
+            if conf.get("gpu_layers") is not None:
+                retry_opts["num_gpu_layers"] = int(conf["gpu_layers"])
+
+            # повтор — тоже стримим
+            t_l0 = time.perf_counter()
             resp2 = call_ollama_json(
                 req.ollama_url, req.model, system, user_small,
-                read_timeout_s=float(llm_timeout),
-                num_ctx=num_ctx_small,
+                read_timeout_s=float(conf["timeout_s"]),
+                num_ctx=int(num_ctx_small),
                 num_predict=int(retry_tokens),
-                temperature=max(0.0, float(llm_temp) * 0.9),
-                options={"top_p": float(llm_top_p), "repeat_penalty": 1.05},
+                temperature=max(0.0, float(conf["temperature"]) * 0.9),
+                options=retry_opts,
+                keep_alive=conf["keep_alive"],
+                force_stream=True,
+                per_chunk_timeout_s=float(settings.LLM_STREAM_CHUNK_TIMEOUT),
             )
+
             data2 = normalize_result(resp2)
             if not _is_empty(data2):
                 data = data2
+            t_l1 = time.perf_counter()
 
             if "disclaimer" in data and isinstance(data["disclaimer"], str):
                 if "timeout" in data["disclaimer"]:
@@ -777,8 +993,10 @@ def analyze_ep(req: AnalyzeReq):
             data["score"] = max(0, data["score"] - 10 * crit_count)
             data["disclaimer"] += f" (Обнаружено {crit_count} критических ошибок.)"
 
+        # --- Перфоманс-лог ---
         t2 = time.perf_counter()
-        print(f"⏱️ perf: retrieval={int((t_r1-t_r0)*1000)}ms, llm={int((t_l1-t_l0)*1000)}ms, total={int((t2-t0)*1000)}ms")
+        def _ms(a, b): return int((b - a) * 1000) if a is not None and b is not None else 0
+        print(f"⏱️ perf: retrieval={_ms(t_r0, t_r1)}ms, llm={_ms(t_l0, t_l1)}ms, total={_ms(t0, t2)}ms")
 
         return {"result": data, "citations_used": [x["doc_id"] for x in ctx_items]}
 
@@ -797,7 +1015,7 @@ def analyze_ep(req: AnalyzeReq):
 # UI
 # ================================
 UI_HTML = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AI-ассистент врача (MVP)</title>
+<title>AI-ассистент врача (MVP21)</title>
 <style>
 body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#f6f7fb;margin:0;color:#101828}
 .wrap{max-width:1100px;margin:20px auto;padding:16px}
@@ -818,7 +1036,7 @@ textarea{min-height:180px}
 </style>
 <div class="wrap">
   <div class="card">
-    <h1>AI-ассистент врача (MVP) <span id="score" class="badge">оценка: —</span></h1>
+    <h1>AI-ассистент врача (MVP12) <span id="score" class="badge">оценка: —</span></h1>
     <div class="small">API: <span id="api"></span></div>
   </div>
   <div class="card">

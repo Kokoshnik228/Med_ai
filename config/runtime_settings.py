@@ -59,8 +59,8 @@ CONTROL: Dict[str, Any] = {
 
     # Retrieval
     "RETR_TOP_K":         4,
-    "RETR_PER_DOC_LIMIT": 1,          # держи 1 при k>=4..6, чтобы не дублировать из одного дока
-    "CTX_SNIPPET_LIMIT":  900,        # сколько символов контекста отдавать в LLM
+    "RETR_PER_DOC_LIMIT": 1,          
+    "CTX_SNIPPET_LIMIT":  400,        # сколько символов контекста отдавать в LLM
 
     # Paths & indexes
     "PAGES_DIR":          "data",
@@ -76,7 +76,7 @@ CONTROL: Dict[str, Any] = {
 
     # Reranker
     "RERANKER_ENABLED": True,
-    "RERANK_TOP_K":     50,
+    "RERANK_TOP_K":     20,
     "RERANKER_MODEL":   "BAAI/bge-reranker-v2-m3",
 
     # EasyOCR
@@ -88,11 +88,18 @@ CONTROL: Dict[str, Any] = {
 
     # Logs
     "LOG_LEVEL": "INFO",
+    
 
     # LLM лимиты/таймауты
     "LLM_NUM_CTX":    4096,
-    "LLM_MAX_TOKENS": 768,
-    "LLM_TIMEOUT":    80,  # сек
+    "LLM_MAX_TOKENS": 300,
+    "LLM_TIMEOUT":    250, # сек
+    "LLM_CTX_MARGIN": 768,
+    "LLM_MIN_CTX": 2048, 
+    "LLM_KEEP_ALIVE": "30m",     # чтобы держать модель тёплой
+    "LLM_NUM_GPU_LAYERS": -1,
+    "LLM_STREAM_CHUNK_TIMEOUT": 30,
+    "LLM_TEMPERATURE": 0.2,
 }
 
 # Для обратной совместимости:
@@ -138,10 +145,19 @@ class Settings:
     TRANSFORMERS_CACHE: str = os.getenv("TRANSFORMERS_CACHE", CONTROL["TRANSFORMERS_CACHE"])
 
     # --- Logs & LLM ---
+    LLM_KEEP_ALIVE: str = os.getenv("LLM_KEEP_ALIVE", CONTROL["LLM_KEEP_ALIVE"])
+    LLM_STREAM_CHUNK_TIMEOUT: int = _to_int(os.getenv("LLM_STREAM_CHUNK_TIMEOUT"), CONTROL["LLM_STREAM_CHUNK_TIMEOUT"])
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", CONTROL["LOG_LEVEL"])
     LLM_NUM_CTX: int = _to_int(os.getenv("LLM_NUM_CTX"), CONTROL["LLM_NUM_CTX"])
     LLM_MAX_TOKENS: int = _to_int(os.getenv("LLM_MAX_TOKENS"), CONTROL["LLM_MAX_TOKENS"])
     LLM_TIMEOUT: int = _to_int(os.getenv("LLM_TIMEOUT"), CONTROL["LLM_TIMEOUT"])
+    # ── в class Settings (раздел "Logs & LLM") добавь поля:
+    LLM_CTX_MARGIN: int = _to_int(os.getenv("LLM_CTX_MARGIN"), CONTROL["LLM_CTX_MARGIN"])
+    LLM_MIN_CTX:   int = _to_int(os.getenv("LLM_MIN_CTX"),   CONTROL["LLM_MIN_CTX"])
+    # и эти два, чтобы быть полностью централизованным:
+    LLM_KEEP_ALIVE: str = os.getenv("LLM_KEEP_ALIVE", CONTROL["LLM_KEEP_ALIVE"])
+    LLM_NUM_GPU_LAYERS: int = _to_int(os.getenv("LLM_NUM_GPU_LAYERS"), CONTROL["LLM_NUM_GPU_LAYERS"])
+
 
     def __init__(self) -> None:
         # Подготовим каталоги
@@ -150,6 +166,13 @@ class Settings:
 
         _ensure_dir(Path(self.EASYOCR_DIR))
         _ensure_dir(Path(self.EASYOCR_DIR) / "model")
+
+        # ── в __init__ (ниже прочих setdefault) по желанию пробрось в окружение:
+        os.environ.setdefault("LLM_KEEP_ALIVE", self.LLM_KEEP_ALIVE)
+        os.environ.setdefault("LLM_NUM_GPU_LAYERS", str(self.LLM_NUM_GPU_LAYERS))
+        os.environ.setdefault("LLM_CTX_MARGIN", str(self.LLM_CTX_MARGIN))
+        os.environ.setdefault("LLM_MIN_CTX",   str(self.LLM_MIN_CTX))
+
 
         # Пробросим базовые переменные окружения для кода, который их ожидает
         os.environ.setdefault("QDRANT_URL", self.QDRANT_URL)
@@ -185,6 +208,8 @@ class Settings:
 
     def pretty_print(self) -> None:
         print("🔁 runtime_settings.py loaded")
+        print(f"  LLM     = num_ctx={self.LLM_NUM_CTX}, max_tokens={self.LLM_MAX_TOKENS}, timeout={self.LLM_TIMEOUT}s")
+        print(f"  LLM.ex  = min_ctx={self.LLM_MIN_CTX}, ctx_margin={self.LLM_CTX_MARGIN}, keep_alive={self.LLM_KEEP_ALIVE}, gpu_layers={self.LLM_NUM_GPU_LAYERS}")
         print(f"  APP_ENV = {self.APP_ENV}")
         print(f"  APP     = {self.APP_HOST}:{self.APP_PORT}")
         print(f"  QDRANT  = {self.QDRANT_URL} (collection={self.QDRANT_COLLECTION})")
