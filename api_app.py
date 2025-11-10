@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
 from __future__ import annotations
-from config.runtime_settings import settings
-
 
 import json
 import os
@@ -27,10 +25,9 @@ try:
 except Exception as e:
     print(f"⚠️ dotenv load skipped: {e}")
 
-# runtime settings: после .env
+# runtime settings: импорт ПОСЛЕ загрузки .env
 from config.runtime_settings import settings  # noqa: E402
 try:
-    # важное: продавливаем CONTROL в окружение и объект
     settings.apply_env(force=True)
 except Exception:
     pass
@@ -61,6 +58,24 @@ from rag.bm25_utils import bm25_search, retrieve_hybrid, embed_query_hf  # noqa:
 _HTTP = requests.Session()
 _HTTP.headers.update({"Connection": "keep-alive"})
 
+# ----- Локальные хелперы по моделям (из централизованного runtime) -----
+def llm_get_allowed():
+    return list(getattr(settings, "LLM_ALLOWED", []) or [])
+
+def llm_get_active():
+    return str(getattr(settings, "LLM_ACTIVE", "") or "")
+
+def llm_get_preset(model_id: str) -> dict:
+    return dict((getattr(settings, "LLM_PRESETS", {}) or {}).get(model_id, {}))
+
+def llm_get_labels() -> dict:
+    pretty = {
+        "llama3.1:8b": "Llama 3.1 (8B)",
+        "llama3.1:70b": "Llama 3.1 (70B)",
+        "deepseek-r1:32b": "DeepSeek R1 (32B)",
+    }
+    return {m: pretty.get(m, m) for m in llm_get_allowed()}
+
 # ================================
 # FastAPI
 # ================================
@@ -71,7 +86,6 @@ app.add_middleware(
     allow_methods=["*"], allow_headers=["*"]
 )
 
-# [api_app.py] — положи это рядом с остальными вспомогательными функциями
 def _as_int(v, default):
     try:
         return int(str(v))
@@ -85,14 +99,8 @@ def _as_float(v, default):
         return default
 
 def _llm_conf_from_settings() -> dict:
-    """
-    Централизованная конфигурация вызова LLM.
-    Источники приоритезированы: ENV > settings > дефолт.
-    Гарантирует наличие всех ключей, чтобы не было KeyError.
-    """
-    # базовые дефолты
     d_model       = getattr(settings, "LLM_MODEL", "llama3.1:8b")
-    d_base_url    = getattr(settings, "LLM_BASE_URL", "http://host.docker.internal:11434")
+    d_base_url    = getattr(settings, "LLM_BASE_URL", "http://ollama:11434")
     d_num_ctx     = getattr(settings, "LLM_NUM_CTX", 4096)
     d_max_tokens  = getattr(settings, "LLM_MAX_TOKENS", 300)
     d_timeout_s   = getattr(settings, "LLM_TIMEOUT", 60)
@@ -102,25 +110,19 @@ def _llm_conf_from_settings() -> dict:
     d_gpu_layers  = -1
     d_keep_alive  = "30m"
 
-    conf = {
+    return {
         "model":        os.getenv("LLM_MODEL", d_model),
         "base_url":     os.getenv("LLM_BASE_URL", d_base_url),
-
-        # лимиты
         "num_ctx_cap":  _as_int(os.getenv("LLM_NUM_CTX"), d_num_ctx),
         "max_tokens":   _as_int(os.getenv("LLM_MAX_TOKENS"), d_max_tokens),
         "timeout_s":    _as_int(os.getenv("LLM_TIMEOUT"), d_timeout_s),
-
-        # сэмплинг
         "temperature":      _as_float(os.getenv("LLM_TEMPERATURE"), d_temp),
         "top_p":            _as_float(os.getenv("LLM_TOP_P"), d_top_p),
         "repeat_penalty":   _as_float(os.getenv("LLM_REPEAT_PENALTY"), d_repeat_pen),
-
-        # GPU/сеанс
         "gpu_layers":   _as_int(os.getenv("LLM_NUM_GPU_LAYERS"), d_gpu_layers),
         "keep_alive":   os.getenv("LLM_KEEP_ALIVE", d_keep_alive),
     }
-    return conf
+
 # ================================
 # Config (yaml + runtime overrides)
 # ================================
@@ -131,9 +133,7 @@ CONF_DIR = ROOT / "config"
 DEFAULT_YAML = CONF_DIR / "default.yaml"
 LOCAL_YAML = CONF_DIR / "local.yaml"
 
-
 def load_runtime_overrides() -> Dict[str, Any]:
-    """Подхватывает config/runtime_settings.py (dict RUNTIME), можно менять без пересборки."""
     try:
         import config.runtime_settings as rs  # type: ignore
         importlib.reload(rs)
@@ -154,7 +154,6 @@ def env_bool(name: str, default: bool) -> bool:
         return True
     if v in ("0", "false", "no", "n", "off", ""):
         return False
-    # на всякий случай: попробуем как int
     try:
         return bool(int(v))
     except Exception:
@@ -167,7 +166,6 @@ def _env_flag(name: str, default: bool) -> bool:
     return str(v).strip().lower() in ("1", "true", "yes", "on")
 
 def load_config() -> Dict[str, Any]:
-    
     def _load_yaml(p: Path) -> Dict[str, Any]:
         try:
             data = yaml.safe_load(p.read_text(encoding="utf-8")) if p.exists() else {}
@@ -182,7 +180,7 @@ def load_config() -> Dict[str, Any]:
             "collection": os.getenv("QDRANT_COLLECTION", "med_kb_v3"),
         },
         "ollama": {
-            "base_url": os.getenv("LLM_BASE_URL", "http://host.docker.internal:11434"),
+            "base_url": os.getenv("LLM_BASE_URL", "http://ollama:11434"),
             "model": os.getenv("LLM_MODEL", os.getenv("MODEL_ID", "llama3.1:8b")),
             "max_tokens": int(os.getenv("LLM_MAX_TOKENS", "2048")),
             "timeout_s": int(os.getenv("LLM_TIMEOUT", "60")),
@@ -190,8 +188,6 @@ def load_config() -> Dict[str, Any]:
             "top_p": float(os.getenv("LLM_TOP_P", "0.95")),
             "num_ctx": int(os.getenv("LLM_NUM_CTX", "6144")),
         },
-
-
         "retrieval": {"k": settings.RETR_TOP_K},
         "embedding": {
             "backend": os.getenv("EMB_BACKEND", settings.EMB_BACKEND or "hf"),
@@ -199,8 +195,6 @@ def load_config() -> Dict[str, Any]:
             "device": os.getenv("HF_DEVICE", settings.HF_DEVICE or "auto"),
             "fp16": _env_flag("HF_FP16", bool(getattr(settings, "HF_FP16", True))),
         },
-
-        
         "chunking": {"child_w": 200, "child_overlap": 35, "parent_w": 800},
         "prompt": {
             "system": (
@@ -338,7 +332,7 @@ def _qdrant_client_rest(url_override: Optional[str] = None):
     return QdrantClient(url=url, timeout=10, prefer_grpc=False, grpc_port=None)
 
 # ================================
-# LLM через Ollama
+# LLM через Ollama — helpers
 # ================================
 def _trim_code_fences(txt: str) -> str:
     txt = re.sub(r"^\s*```(?:json)?\s*", "", txt, flags=re.IGNORECASE)
@@ -346,19 +340,18 @@ def _trim_code_fences(txt: str) -> str:
     return txt.strip()
 
 def safe_json_extract(s: str) -> Dict[str, Any]:
-    import json as _json, re
+    import json as _json, re as _re
 
     def _default():
         return {
-            "score": None, "subscores": {}, "critical_errors": [],
-            "recommendations": [], "citations": [],
-            "disclaimer": "Парсинг ответа не удался."
+            "score": None, "subscores": {}, "critical_errors": [], "recommendations": [],
+            "citations": [], "disclaimer": "Парсинг ответа не удался."
         }
 
     if not s:
         return _default()
 
-    s1 = re.sub(r"```(?:json)?", "", s, flags=re.IGNORECASE).replace("```", "").strip()
+    s1 = _re.sub(r"```(?:json)?", "", s, flags=_re.IGNORECASE).replace("```", "").strip()
 
     try:
         obj = _json.loads(s1)
@@ -389,7 +382,7 @@ def safe_json_extract(s: str) -> Dict[str, Any]:
         try:
             return _json.loads(chunk)
         except Exception:
-            chunk2 = re.sub(r",\s*([}\]])", r"\1", chunk)
+            chunk2 = _re.sub(r",\s*([}\]])", r"\1", chunk)
             try:
                 return _json.loads(chunk2)
             except Exception:
@@ -405,8 +398,8 @@ def safe_json_extract(s: str) -> Dict[str, Any]:
 
 def normalize_result(r: Dict[str, Any]) -> Dict[str, Any]:
     out: Dict[str, Any] = {
-        "score": 0, "subscores": {}, "critical_errors": [],
-        "recommendations": [], "citations": [], "disclaimer": ""
+        "score": 0, "subscores": {}, "critical_errors": [], "recommendations": [],
+        "citations": [], "disclaimer": ""
     }
     try:
         sc = r.get("score", 0) if isinstance(r, dict) else 0
@@ -464,38 +457,30 @@ def _ns_to_ms(ns: int) -> int:
     except Exception:
         return 0
 
-# --- Ollama HTTP helpers (stream-first) ---
-
 # --- Ollama HTTP helpers: stream-first, no JSON format on stream ---
+import requests as _requests
 
-# == ollama_io.py == (или где у тебя живут эти функции)
-import json
-import requests
-from typing import Optional, Dict, Any
+_HTTP2 = _requests.Session()
 
-# общий http-сесс
-_HTTP = requests.Session()
-
-def _trim_code_fences(s: str) -> str:
+def _trim_code_fences2(s: str) -> str:
     s = (s or "").strip()
     if s.startswith("```"):
         s = s.strip("` \n")
-        # убираем возможный префикс типа json
         s = s.split("\n", 1)[-1]
     return s.strip()
 
-def safe_json_extract(s: str) -> Dict[str, Any]:
-    s = _trim_code_fences(s)
+def safe_json_extract2(s: str) -> Dict[str, Any]:
+    s = _trim_code_fences2(s)
     try:
         obj = json.loads(s)
         if isinstance(obj, dict):
             return obj
-        # если список – завернём в объект
         return {"result": obj}
     except Exception:
-        # вернём «обёртку» с дисклеймером, чтобы не падать
-        return {"score": None, "subscores": {}, "critical_errors": [], "recommendations": [], "citations": [],
-                "disclaimer": "LLM вернул не-JSON (stream relax)."}
+        return {
+            "score": None, "subscores": {}, "critical_errors": [], "recommendations": [], "citations": [],
+            "disclaimer": "LLM вернул не-JSON (stream relax)."
+        }
 
 def _ollama_generate_stream(
     ollama_url: str,
@@ -506,16 +491,20 @@ def _ollama_generate_stream(
     enforce_json_on_stream: bool = False,
 ) -> str:
     """
-    Стримим токены. ВНИМАНИЕ: по умолчанию НЕ ставим format=json на стриме,
-    чтобы не ждать «целый JSON» и получать токены сразу.
+    Если enforce_json_on_stream=True — добавляем "format":"json" прямо в стрим-пейлоад.
+    Это не мешает инкрементальному выводу, но итоговая строка 'response' будет JSON.
     """
-    # Готовим payload ДЛЯ СТРИМА: УБИРАЕМ format, если не требуется жёсткая валидация.
+    import json as _json
+
     stream_payload = dict(payload)
     stream_payload["stream"] = True
-    if not enforce_json_on_stream and "format" in stream_payload:
+    if enforce_json_on_stream:
+        stream_payload["format"] = "json"
+    else:
+        # если не навязываем JSON — удаляем возможный format из payload
         stream_payload.pop("format", None)
 
-    with _HTTP.post(
+    with _HTTP2.post(
         f"{ollama_url.rstrip('/')}/api/generate",
         json=stream_payload,
         timeout=(float(connect_timeout_s), float(per_chunk_timeout_s)),
@@ -527,15 +516,13 @@ def _ollama_generate_stream(
             if not ln:
                 continue
             try:
-                chunk = json.loads(ln)
-                # Стандартный формат Ollama stream: {"response": "..." , "done": false}
+                chunk = _json.loads(ln)
                 if "response" in chunk and chunk["response"]:
                     buf.append(chunk["response"])
-                # можно логировать «первый токен» для диагностики латентности
             except Exception:
-                # если прилетело что-то не JSON (редко) — просто пропускаем
                 continue
         return "".join(buf)
+
 
 
 def call_ollama_json(
@@ -545,7 +532,7 @@ def call_ollama_json(
     user_prompt: str,
     *,
     connect_timeout_s: float = 3.0,
-    read_timeout_s: float = 90.0,
+    read_timeout_s: float = 180.0,
     stream_chunk_timeout_s: float = 30.0,
     num_ctx: int = 6144,
     num_predict: int = 160,
@@ -556,16 +543,32 @@ def call_ollama_json(
     **_ignored_kwargs,
 ) -> Dict[str, Any]:
     """
-    1) Пытаемся стримить БЕЗ format=json (быстрое появление токенов).
-    2) Если таймаут/ошибка — делаем короткую блокирующую попытку с format=json.
+    Алгоритм:
+      1) Пытаемся стримить (при необходимости с format=json).
+      2) Если пришло не-JSON → делаем блокирующий вызов с format=json и теми же параметрами.
+      3) Возвращаем нормализованный JSON из safe_json_extract2.
     """
     try:
-        if not ollama_url:
-            # твой дефолт, как раньше
-            ollama_url = "http://host.docker.internal:11434"
+        import os as _os
+        import json as _json
+        import time as _time
 
-        # собираем options (фильтруем «опасные» ключи)
-        bad = {"gpu_layers", "num_gpu", "main_gpu"}  # мы сами явно пробрасываем gpu_layers, если надо
+        def _looks_like_json(s: str) -> bool:
+            try:
+                _json.loads(s)
+                return True
+            except Exception:
+                return False
+
+        t0 = _time.perf_counter()
+
+        if not ollama_url:
+            ollama_url = "http://ollama:11434"
+
+        # Флаг принудительного JSON в стриме (берём из рантайма/ENV)
+        enforce_json_stream = str(_os.getenv("LLM_ENFORCE_JSON_STREAM", "0")).strip().lower() in {"1","true","t","yes","y","on"}
+
+        bad = {"gpu_layers", "num_gpu", "main_gpu"}
         opts = {
             "num_ctx": int(num_ctx),
             "num_predict": int(num_predict),
@@ -580,13 +583,18 @@ def call_ollama_json(
             "model": model,
             "prompt": user_prompt,
             "system": system_prompt,
-            # ВНИМАНИЕ: format='json' НЕ ставим на стриме; добавим только в блокирующей попытке
             "options": opts,
         }
         if keep_alive is not None:
             base_payload["keep_alive"] = keep_alive
 
-        # --- 1) STREAM-FIRST (без format=json) ---
+        print(
+            f"LLM STREAM: url={ollama_url} model={model} "
+            f"timeouts(connect={connect_timeout_s}s, read={read_timeout_s}s, chunk={stream_chunk_timeout_s}s) "
+            f"ctx={opts.get('num_ctx')} max_tokens={opts.get('num_predict')}"
+        )
+
+        # 1) STREAM-FIRST
         try:
             print("LLM STREAM: start")
             text = _ollama_generate_stream(
@@ -594,57 +602,66 @@ def call_ollama_json(
                 base_payload,
                 per_chunk_timeout_s=stream_chunk_timeout_s,
                 connect_timeout_s=connect_timeout_s,
-                enforce_json_on_stream=False,  # критично
+                enforce_json_on_stream=bool(enforce_json_stream),
             )
-            text = _trim_code_fences(text)
+            t1 = _time.perf_counter()
+            text = _trim_code_fences2(text)
             if text:
-                # Пытаемся распарсить как JSON — если не выйдет, safe_json_extract вернёт вежливую обёртку.
-                return safe_json_extract(text)
+                print(f"LLM STREAM: done in {int((t1 - t0)*1000)}ms, {len(text)} chars")
+                if _looks_like_json(text):
+                    return safe_json_extract2(text)
+                else:
+                    print("LLM STREAM: non-JSON — switching to blocking JSON call")
             else:
-                print("LLM STREAM: empty stream result")
-        except requests.exceptions.ReadTimeout:
-            print(f"LLM STREAM: ReadTimeout (chunk {stream_chunk_timeout_s}s), fallback to short blocking call")
+                print("LLM STREAM: empty stream result — switching to blocking JSON call")
+        except _requests.exceptions.ReadTimeout:
+            print(f"LLM STREAM: ReadTimeout (chunk {stream_chunk_timeout_s}s), fallback to blocking")
         except Exception as e:
             print(f"LLM STREAM: error={type(e).__name__}: {e}, fallback to blocking")
 
-        # --- 2) Блокирующая короткая попытка c format=json ---
-        short_payload = dict(base_payload)
-        short_opts = dict(opts)
-        # сильно ужмём длину предсказания, чтобы не ждать
-        short_opts["num_predict"] = min(80, int(opts.get("num_predict", 120)))
-        short_payload["options"] = short_opts
-        short_payload["format"] = "json"  # тут уже можно требовать «валидный JSON» целиком
+        # 2) Блокирующая попытка c format=json (БЕЗ урезания num_predict)
+        block_payload = dict(base_payload)
+        block_payload["format"] = "json"
         try:
-            resp = _HTTP.post(
+            resp = _HTTP2.post(
                 f"{ollama_url.rstrip('/')}/api/generate",
-                json=short_payload,
+                json=block_payload,
                 timeout=(float(connect_timeout_s), float(read_timeout_s)),
             )
             resp.raise_for_status()
             if str(resp.headers.get("content-type", "")).startswith("application/json"):
                 obj = resp.json()
-                # Ответ Ollama в blocking режиме: {"response": "<строка>", "done": true, ...}
                 s = obj.get("response", "") if isinstance(obj, dict) else ""
             else:
                 s = resp.text or ""
-            s = _trim_code_fences(s)
+            s = _trim_code_fences2(s)
             if not s:
-                return {"score": None, "subscores": {}, "critical_errors": [], "recommendations": [], "citations": [],
-                        "disclaimer": "LLM вернул пустой ответ (blocking fallback)."}
-            return safe_json_extract(s)
-        except requests.exceptions.ReadTimeout as e:
-            return {"score": None, "subscores": {}, "critical_errors": [], "recommendations": [], "citations": [],
-                    "disclaimer": f"LLM timeout: {e} (blocking fallback)"}
+                return {
+                    "score": None, "subscores": {}, "critical_errors": [], "recommendations": [], "citations": [],
+                    "disclaimer": "LLM вернул пустой ответ (blocking fallback)."
+                }
+            return safe_json_extract2(s)
+        except _requests.exceptions.ReadTimeout as e:
+            return {
+                "score": None, "subscores": {}, "critical_errors": [], "recommendations": [], "citations": [],
+                "disclaimer": f"LLM timeout: {e} (blocking fallback)"
+            }
         except Exception as e:
-            return {"score": None, "subscores": {}, "critical_errors": [], "recommendations": [], "citations": [],
-                    "disclaimer": f"Ошибка LLM ({type(e).__name__}): {e}"}
+            return {
+                "score": None, "subscores": {}, "critical_errors": [], "recommendations": [], "citations": [],
+                "disclaimer": f"Ошибка LLM ({type(e).__name__}): {e}"
+            }
 
-    except requests.exceptions.ConnectTimeout:
-        return {"score": None, "subscores": {}, "critical_errors": [], "recommendations": [], "citations": [],
-                "disclaimer": f"LLM timeout: соединение >{connect_timeout_s} c."}
+    except _requests.exceptions.ConnectTimeout:
+        return {
+            "score": None, "subscores": {}, "critical_errors": [], "recommendations": [], "citations": [],
+            "disclaimer": f"LLM timeout: соединение >{connect_timeout_s} c."
+        }
     except Exception as e:
-        return {"score": None, "subscores": {}, "critical_errors": [], "recommendations": [], "citations": [],
-                "disclaimer": f"Ошибка LLM ({type(e).__name__}): {e}"}
+        return {
+            "score": None, "subscores": {}, "critical_errors": [], "recommendations": [], "citations": [],
+            "disclaimer": f"Ошибка LLM ({type(e).__name__}): {e}"
+        }
 
 # ================================
 # API models
@@ -654,7 +671,7 @@ class AnalyzeReq(BaseModel):
     query: Optional[str] = None
     k: Optional[int] = Field(default=None)
     model: str = Field(default_factory=lambda: cfg("ollama", "model", default="llama3.1:8b"))
-    ollama_url: Optional[str] = Field(default_factory=lambda: cfg("ollama", "base_url", default="http://host.docker.internal:11434"))
+    ollama_url: Optional[str] = Field(default_factory=lambda: cfg("ollama", "base_url", default="http://ollama:11434"))
 
     if _P_V2:
         @field_validator("k", mode="before")
@@ -706,7 +723,7 @@ def health():
 def debug_config():
     return {
         "ollama": {
-            "base_url": cfg_str("ollama", "base_url", default="http://host.docker.internal:11434"),
+            "base_url": cfg_str("ollama", "base_url", default="http://ollama:11434"),
             "model": cfg_str("ollama", "model", default="llama3.1:8b"),
             "max_tokens": cfg_int("ollama", "max_tokens", default=2048),
             "timeout_s": cfg_int("ollama", "timeout_s", default=60),
@@ -740,20 +757,13 @@ def _compact_case_text(txt: str, target_chars: int = 1400) -> str:
     if not txt:
         return ""
     t = txt
-
-    # Нормализация пробелов/переводов
     t = re.sub(r"[ \t]+", " ", t)
     t = re.sub(r"\n{3,}", "\n\n", t).strip()
-
-    # Убираем часто повторяющиеся отрицания/штампы
     t = re.sub(r"\b(отрицает|не\s+обнаружено|не\s+находился|не\s+отягощен)\b[.,;:\s]*", "нет. ", t, flags=re.IGNORECASE)
     t = re.sub(r"\b(безболезненная|кожа обычной окраски|умеренно влажная|свободн\w*|по средней линии)\b[.,;:\s]*", "", t, flags=re.IGNORECASE)
-
-    # Сжимаем длинные числовые хвосты/повторы пунктуации
     t = re.sub(r"[.;:,]\s*(?:[.;:,]\s*)+", ". ", t)
     t = re.sub(r"\s{2,}", " ", t)
 
-    # Грубая дедупликация предложений
     seen = set()
     out = []
     for sent in re.split(r"(?<=[.!?])\s+", t):
@@ -767,7 +777,6 @@ def _compact_case_text(txt: str, target_chars: int = 1400) -> str:
         out.append(s)
     t = " ".join(out)
 
-    # Урізаем до целевого окна, но стараемся не резать посреди предложения
     if len(t) > target_chars:
         cut = t[:target_chars]
         last_dot = cut.rfind(".")
@@ -780,12 +789,49 @@ def _compact_case_text(txt: str, target_chars: int = 1400) -> str:
 
 @app.post("/analyze")
 def analyze_ep(req: AnalyzeReq):
+    """
+    Эндпоинт анализа кейса.
+    Важное: модель берём из req.model если валидна, иначе — из settings.LLM_ACTIVE.
+    Для DeepSeek-R1 вырезаем <think>...</think> перед нормализацией ответа.
+    """
     try:
         print("🚀 /analyze")
         import os, json, time, re
         t0 = time.perf_counter()
-        # таймеры безопасно инициализируем
         t_r0 = t_r1 = t_l0 = t_l1 = t0
+
+        THINK_TAG_RE = re.compile(r"<think>.*?</think>", flags=re.DOTALL | re.IGNORECASE)
+
+        def strip_think(s: str) -> str:
+            try:
+                return THINK_TAG_RE.sub("", s or "").strip()
+            except Exception:
+                return s
+
+        def sanitize_llm_resp(x):
+            if isinstance(x, str):
+                return strip_think(x)
+            if isinstance(x, dict):
+                y = dict(x)
+                for key in ("response", "message", "text", "raw", "content"):
+                    if key in y and isinstance(y[key], str):
+                        y[key] = strip_think(y[key])
+                return y
+            return x
+
+        def resolve_model(req_model: str | None) -> str:
+            allowed = getattr(settings, "LLM_ALLOWED", []) or []
+            active  = getattr(settings, "LLM_ACTIVE", None)
+            m = (req_model or "").strip() if isinstance(req_model, str) else ""
+            if m and m in allowed:
+                return m
+            if active and active in allowed:
+                return active
+            return allowed[0] if allowed else (m or active or "llama3.1:8b")
+
+        def preset_for(model_id: str) -> dict:
+            presets = getattr(settings, "LLM_PRESETS", {}) or {}
+            return dict(presets.get(model_id, {}))
 
         if looks_meaningless(req.case_text):
             return {"result": {
@@ -794,7 +840,6 @@ def analyze_ep(req: AnalyzeReq):
                 "disclaimer": "Текст кейса не содержит осмысленных данных.",
             }}
 
-        # --- Сбор поискового запроса ---
         def _smart_query(case_text: str) -> str:
             m = re.search(r"\b([A-Za-z]\d{1,2}(?:\.\d+)?)\b", case_text)
             if m:
@@ -814,7 +859,6 @@ def analyze_ep(req: AnalyzeReq):
 
         print("🔍 query =", search_q)
 
-        # --- Ретрив ---
         t_r0 = time.perf_counter()
         ctx_items = retrieve_hybrid(
             search_q, k,
@@ -840,12 +884,11 @@ def analyze_ep(req: AnalyzeReq):
 
         ctx = build_ctx_string(
             ctx_items,
-            max_chars=min(6000, settings.LLM_NUM_CTX * 3),  # общий «потолок» контекста (≈3 симв/токен)
-            per_text_limit=settings.CTX_SNIPPET_LIMIT       # берём из runtime_settings.py
+            max_chars=min(6000, settings.LLM_NUM_CTX * 3),
+            per_text_limit=settings.CTX_SNIPPET_LIMIT
         )
         print(f"📏 lengths: case={len(req.case_text)} ctx={len(ctx)} k={k}")
 
-        # --- Промпт ---
         DEFAULT_SYSTEM = (
             "Ты — медицинский ассистент. ОТВЕЧАЙ ТОЛЬКО НА РУССКОМ ЯЗЫКЕ. "
             "Анализируй текст как врачебный кейс и верни СТРОГО ВАЛИДНЫЙ JSON согласно схеме."
@@ -858,57 +901,72 @@ def analyze_ep(req: AnalyzeReq):
         user_t = cfg("prompt", "user_template", default=DEFAULT_USER_TPL) or DEFAULT_USER_TPL
         user = user_t.format(case_text=req.case_text, ctx=ctx)
 
-        # --- LLM-параметры из централизованных настроек ---
-        conf = _llm_conf_from_settings()
+        model_id = resolve_model(getattr(req, "model", None))
+        pr = preset_for(model_id)
+
+        num_ctx_cap  = int(pr.get("num_ctx",      getattr(settings, "LLM_NUM_CTX", 4096)))
+        max_tokens   = int(pr.get("max_tokens",   getattr(settings, "LLM_MAX_TOKENS", 600)))
+        timeout_s    = int(pr.get("timeout_s",    getattr(settings, "LLM_TIMEOUT", 150)))
+        temperature  = float(pr.get("temperature", 0.2))
+        top_p        = float(pr.get("top_p", 0.95))
+        repeat_pen   = float(pr.get("repeat_penalty", 1.05))
+        gpu_layers   = int(pr.get("gpu_layers",   getattr(settings, "LLM_NUM_GPU_LAYERS", -1) or -1))
+        keep_alive   = str(pr.get("keep_alive",   getattr(settings, "LLM_KEEP_ALIVE", "30m")))
+
         total_est = _approx_tokens(system) + _approx_tokens(user)
+        min_ctx_env = int(os.getenv("LLM_MIN_CTX", str(getattr(settings, "LLM_MIN_CTX", 4096))))
+        ctx_margin  = int(os.getenv("LLM_CTX_MARGIN", str(getattr(settings, "LLM_CTX_MARGIN", 768))))
+        MIN_CTX     = min(num_ctx_cap, max(1024, min_ctx_env))
+        num_ctx     = max(MIN_CTX, min(num_ctx_cap, total_est + ctx_margin))
 
-        num_ctx_cap   = int(conf["num_ctx_cap"])               # напр., 16384
-        min_ctx_env   = int(os.getenv("LLM_MIN_CTX", "4096"))  # даём управлять через ENV
-        ctx_margin    = int(os.getenv("LLM_CTX_MARGIN", "768"))
+        # ключевой момент: таймаут «тишины» между чанками берём из runtime_settings
+        stream_chunk_timeout_s = float(getattr(settings, "LLM_STREAM_CHUNK_TIMEOUT", getattr(settings, "LLM_TIMEOUT", 150)))
 
-        MIN_CTX = min(num_ctx_cap, max(1024, min_ctx_env))
-        num_ctx = max(MIN_CTX, min(num_ctx_cap, total_est + ctx_margin))
-
+        ollama_url = (getattr(req, "ollama_url", None) or settings.LLM_BASE_URL or "").rstrip("/")
         print(
-            f"🤖 LLM url={req.ollama_url or cfg('ollama','base_url', default='N/A')} "
-            f"model={req.model} used_ctx={num_ctx} cap_ctx={num_ctx_cap} "
-            f"min_ctx={MIN_CTX} max_tokens={conf['max_tokens']} timeout={conf['timeout_s']}s"
+            f"🤖 LLM url={ollama_url or 'N/A'} "
+            f"model={model_id} used_ctx={num_ctx} cap_ctx={num_ctx_cap} "
+            f"min_ctx={MIN_CTX} max_tokens={max_tokens} timeout={timeout_s}s"
         )
-        # лог полезной части payload
         _sanitized = {
-            "model": req.model,
+            "model": model_id,
             "options": {
                 "num_ctx": num_ctx,
-                "num_predict": conf["max_tokens"],
-                "temperature": conf["temperature"],
-                "top_p": conf["top_p"],
-                "repeat_penalty": conf["repeat_penalty"],
-                "num_gpu_layers": conf["gpu_layers"],
+                "num_predict": max_tokens,
+                "temperature": temperature,
+                "top_p": top_p,
+                "repeat_penalty": repeat_pen,
+                "num_gpu_layers": gpu_layers,
             },
-            "keep_alive": conf["keep_alive"],
+            "keep_alive": keep_alive,
+            "stream_chunk_timeout_s": stream_chunk_timeout_s,
         }
         print("LLM PAYLOAD (sanitized):", json.dumps(_sanitized, ensure_ascii=False))
 
-        # --- Вызов LLM (стрим по умолчанию — см. Patch 2) ---
+        # ---- LLM вызов ----
         t_l0 = time.perf_counter()
         resp = call_ollama_json(
-            req.ollama_url, req.model, system, user,
-            read_timeout_s=float(conf["timeout_s"]),
-            num_ctx=num_ctx,
-            num_predict=int(conf["max_tokens"]),
-            temperature=float(conf["temperature"]),
+            ollama_url, model_id, system, user,
+            read_timeout_s=float(timeout_s),
+            num_ctx=int(num_ctx),
+            num_predict=int(max_tokens),
+            temperature=float(temperature),
             options={
-                "top_p": float(conf["top_p"]),
-                "repeat_penalty": float(conf["repeat_penalty"]),
-                "num_gpu_layers": int(conf["gpu_layers"]) if conf["gpu_layers"] is not None else -1,
+                "top_p": float(top_p),
+                "repeat_penalty": float(repeat_pen),
+                "num_gpu_layers": int(gpu_layers),
             },
-            keep_alive=conf["keep_alive"],
-            force_stream=True,                                  # стрим сразу
-            per_chunk_timeout_s=float(settings.LLM_STREAM_CHUNK_TIMEOUT),  # таймаут «тишины» между чанками
+            keep_alive=keep_alive,
+            stream_chunk_timeout_s=float(getattr(settings, "LLM_STREAM_CHUNK_TIMEOUT", 30)),
         )
-
+        resp = sanitize_llm_resp(resp)
         data = normalize_result(resp)
         t_l1 = time.perf_counter()
+
+        # --- решаем, делать ли fast-retry ---
+        fast_retry_enabled = bool(getattr(settings, "FAST_RETRY_ENABLED", True))
+        fast_retry_on_empty = bool(getattr(settings, "FAST_RETRY_ON_EMPTY", False))  # по умолчанию False
+        timed_out = isinstance(resp, dict) and isinstance(resp.get("disclaimer"), str) and "timeout" in resp["disclaimer"]
 
         def _is_empty(d):
             return (
@@ -917,43 +975,45 @@ def analyze_ep(req: AnalyzeReq):
                 not d.get("critical_errors") and
                 not d.get("recommendations")
             )
-        timed_out = isinstance(resp, dict) and isinstance(resp.get("disclaimer"), str) and "timeout" in resp["disclaimer"]
 
-        # --- Fast-retry при таймауте/пустоте ---
-        if timed_out or _is_empty(data):
+        need_retry = fast_retry_enabled and (timed_out or (fast_retry_on_empty and _is_empty(data)))
+
+        if need_retry:
             print("⏩ fast-retry: shrinking context and num_predict")
 
+            shrink_ratio = float(getattr(settings, "FAST_RETRY_CTX_SHRINK_RATIO", 0.65))
             ctx_small = build_ctx_string(
-                ctx_items[:min(3, len(ctx_items))],
-                max_chars=6000,
-                per_text_limit=700
+                ctx_items[:max(1, int(len(ctx_items) * shrink_ratio))],
+                max_chars=int(6000 * shrink_ratio),
+                per_text_limit=int(settings.CTX_SNIPPET_LIMIT * shrink_ratio)
             )
             user_small = user_t.format(case_text=req.case_text, ctx=ctx_small)
 
             total_est_small = _approx_tokens(system) + _approx_tokens(user_small)
             num_ctx_small = min(num_ctx_cap, max(1024, total_est_small + 128))
-            retry_tokens = min(60, conf["max_tokens"])
+
+            # берём либо явный лимит для ретрая, либо тот же max_tokens
+            retry_tokens_cfg = int(getattr(settings, "FAST_RETRY_MAX_TOKENS", 0) or 0)
+            retry_tokens = int(retry_tokens_cfg if retry_tokens_cfg > 0 else max_tokens)
 
             retry_opts = {
-                "top_p": float(conf["top_p"]),
-                "repeat_penalty": float(conf["repeat_penalty"]),
+                "top_p": float(top_p),
+                "repeat_penalty": float(repeat_pen),
+                "num_gpu_layers": int(gpu_layers),
             }
-            if conf.get("gpu_layers") is not None:
-                retry_opts["num_gpu_layers"] = int(conf["gpu_layers"])
 
-            # повтор — тоже стримим
             t_l0 = time.perf_counter()
             resp2 = call_ollama_json(
-                req.ollama_url, req.model, system, user_small,
-                read_timeout_s=float(conf["timeout_s"]),
+                ollama_url, model_id, system, user_small,
+                read_timeout_s=float(timeout_s),
                 num_ctx=int(num_ctx_small),
                 num_predict=int(retry_tokens),
-                temperature=max(0.0, float(conf["temperature"]) * 0.9),
+                temperature=max(0.0, float(temperature) * 0.9),
                 options=retry_opts,
-                keep_alive=conf["keep_alive"],
-                force_stream=True,
-                per_chunk_timeout_s=float(settings.LLM_STREAM_CHUNK_TIMEOUT),
+                keep_alive=keep_alive,
+                stream_chunk_timeout_s=float(getattr(settings, "LLM_STREAM_CHUNK_TIMEOUT", 30)),
             )
+            resp2 = sanitize_llm_resp(resp2)
 
             data2 = normalize_result(resp2)
             if not _is_empty(data2):
@@ -967,33 +1027,25 @@ def analyze_ep(req: AnalyzeReq):
                     data["disclaimer"] = (data["disclaimer"] + " ") if data["disclaimer"] else ""
                     data["disclaimer"] += "Выполнен fast-retry: контекст и длина ответа уменьшены."
 
-            if _is_empty(data) and not data.get("recommendations"):
-                data["recommendations"] = [{
-                    "what_to_change": "Уменьшите K (например, до 4–6) или укоротите кейс",
-                    "rationale": "Слишком тяжёлый промпт замедляет ответ модели."
-                }]
 
-        # --- Корректировка по длине контекста ---
+        # ---- пост-обработка ----
         ctx_len = sum(len(it.get("text", "")) for it in ctx_items)
         if ctx_len < 500:
-            data["score"] = max(0, data.get("score", 0) * 0.5)
-            data["disclaimer"] += " (Недостаточно контекста из базы знаний — достоверность снижена.)"
+            data["score"] = max(0, (data.get("score") or 0) * 0.5)
+            data["disclaimer"] = (data.get("disclaimer") or "") + " (Недостаточно контекста из базы знаний — достоверность снижена.)"
         elif ctx_len < 1500:
-            data["score"] = max(0, data.get("score", 0) * 0.8)
-            data["disclaimer"] += " (Контекст ограничен — достоверность частично снижена.)"
+            data["score"] = max(0, (data.get("score") or 0) * 0.8)
+            data["disclaimer"] = (data.get("disclaimer") or "") + " (Контекст ограничен — достоверность частично снижена.)"
 
-        # --- Цитаты ---
         data["citations"] = build_context_citations(ctx_items, max_out=5) or [
             f"{it['doc_id']} стр.{it['page_start']}-{it['page_end']}" for it in ctx_items[:5]
         ]
 
-        # --- Штраф за критические ошибки ---
         crit_count = len(data.get("critical_errors", []))
         if crit_count > 0:
-            data["score"] = max(0, data["score"] - 10 * crit_count)
-            data["disclaimer"] += f" (Обнаружено {crit_count} критических ошибок.)"
+            data["score"] = max(0, (data.get("score") or 0) - 10 * crit_count)
+            data["disclaimer"] = (data.get("disclaimer") or "") + f" (Обнаружено {crit_count} критических ошибок.)"
 
-        # --- Перфоманс-лог ---
         t2 = time.perf_counter()
         def _ms(a, b): return int((b - a) * 1000) if a is not None and b is not None else 0
         print(f"⏱️ perf: retrieval={_ms(t_r0, t_r1)}ms, llm={_ms(t_l0, t_l1)}ms, total={_ms(t0, t2)}ms")
@@ -1011,16 +1063,19 @@ def analyze_ep(req: AnalyzeReq):
             }
         }
 
+
 # ================================
 # UI
 # ================================
 UI_HTML = """<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>AI-ассистент врача (MVP21)</title>
+<title>AI-ассистент врача (MVP)</title>
 <style>
 body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#f6f7fb;margin:0;color:#101828}
 .wrap{max-width:1100px;margin:20px auto;padding:16px}
 .card{background:#fff;border:1px solid #e5e7eb;border-radius:16px;box-shadow:0 1px 3px rgba(16,24,40,.08);padding:16px;margin-bottom:16px}
 h1{font-size:20px;margin:0 0 8px}
+h3{margin:0 0 6px}
+h4{margin:12px 0 6px}
 label{font-weight:600;font-size:14px;margin:6px 0;display:block}
 input,select,textarea{width:100%;border:1px solid #d0d5dd;border-radius:10px;padding:10px;font-size:14px}
 textarea{min-height:180px}
@@ -1033,15 +1088,20 @@ textarea{min-height:180px}
 .err{color:#b91c1c}
 .grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 .help{font-size:12px;color:#667085;margin-top:4px}
+.muted{color:#667085}
+li{margin:6px 0}
 </style>
+
 <div class="wrap">
   <div class="card">
-    <h1>AI-ассистент врача (MVP12) <span id="score" class="badge">оценка: —</span></h1>
+    <h1>AI-ассистент врача (MVP) <span id="score" class="badge">оценка: —</span></h1>
     <div class="small">API: <span id="api"></span></div>
   </div>
+
   <div class="card">
     <label>Текст кейса</label>
     <textarea id="case" placeholder="Вставьте кейс: жалобы, анамнез, диагноз, назначения..."></textarea>
+
     <div class="row">
       <div>
         <label>Запрос для поиска (необязательно)</label>
@@ -1050,63 +1110,61 @@ textarea{min-height:180px}
       <div>
         <label>Модель / K</label>
         <div class="row" style="grid-template-columns:2fr 1fr;gap:8px">
-          <select id="model"><option>llama3.1:8b</option><option>llama3.1:70b</option></select>
+          <select id="model"></select>
           <input id="k" type="number" value="" min="0" max="20" placeholder="по умолч.">
         </div>
         <div class="help">Оставьте K пустым — возьмётся значение из настроек сервера</div>
       </div>
     </div>
-    <div style="margin-top:10px;display:flex;gap:8px;align-items:center">
+
+    <div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
       <button id="run" class="btn">Проанализировать</button>
       <button id="reindex" class="btn" style="background:#059669">🔄 Обновить базу</button>
       <span id="busy" class="small" style="display:none">⏳ выполняется…</span>
       <span id="error" class="small err"></span>
     </div>
   </div>
+
   <div class="card">
-    <h3 style="margin:0 0 6px">Результат</h3>
+    <h3>Результат</h3>
     <div class="grid2" id="subs"></div>
-    <div><h4>Критические ошибки</h4><ul id="crit"></ul></div>
-    <div><h4>Рекомендации</h4><ul id="recs"></ul></div>
-    <div><h4>Источники (цитаты)</h4><ul id="cits"></ul></div>
-    <details><summary class="small">Сырой JSON</summary><pre id="raw" class="mono"></pre></details>
+
+    <div>
+      <h4>Критические ошибки</h4>
+      <ul id="crit"></ul>
+    </div>
+
+    <div>
+      <h4>Рекомендации</h4>
+      <ul id="recs"></ul>
+    </div>
+
+    <div>
+      <h4>Источники (цитаты)</h4>
+      <ul id="cits"></ul>
+    </div>
+
+    <div id="disc" class="small muted" style="margin-top:8px"></div>
+
+    <details style="margin-top:8px">
+      <summary class="small">Сырой JSON</summary>
+      <pre id="raw" class="mono"></pre>
+    </details>
   </div>
 </div>
+
 <script>
-const API = window.location.origin;
+const API = window.location.origin; // если фронт обслуживается тем же FastAPI
 document.getElementById('api').textContent = API;
 
 const el = id => document.getElementById(id);
 const show = (n,on) => n.style.display = on ? '' : 'none';
 
-function colorForScore(s){ if(typeof s!=='number') return ''; if(s>=85) return '#dcfce7'; if(s>=65) return '#fef9c3'; return '#fee2e2'; }
-
-function renderResult(r){
-  const sc = r.score ?? '—';
-  const sb = el('score');
-  sb.textContent = 'оценка: ' + sc;
-  sb.style.background = colorForScore(sc);
-
-  const subs = el('subs'); subs.innerHTML = '';
-  Object.entries(r.subscores||{}).forEach(([k,v])=>{
-    const d=document.createElement('div'); d.className='card'; d.style.margin=0;
-    d.innerHTML=`<div class="small">${labelMap[k] || k}</div><div style="font-weight:700">${v??'—'}</div>`;
-    subs.appendChild(d);
-  });
-
-  const crit=el('crit'); crit.innerHTML=''; (r.critical_errors||[]).forEach(x=>{
-    const li=document.createElement('li'); li.textContent=`${x.type}: ${x.explain}`; crit.appendChild(li);
-  });
-
-  const recs=el('recs'); recs.innerHTML=''; (r.recommendations||[]).forEach(x=>{
-    const li=document.createElement('li'); li.textContent=`${x.what_to_change} — ${x.rationale}`; recs.appendChild(li);
-  });
-
-  const cits=el('cits'); cits.innerHTML=''; (r.citations||[]).forEach(x=>{
-    const li=document.createElement('li'); li.textContent=String(x); cits.appendChild(li);
-  });
-
-  el('raw').textContent = JSON.stringify(r,null,2);
+function colorForScore(s){
+  if (typeof s !== 'number') return '';
+  if (s >= 85) return '#dcfce7';   // зелёный фон
+  if (s >= 65) return '#fef9c3';   // жёлтый фон
+  return '#fee2e2';                // красный фон
 }
 
 const labelMap = {
@@ -1122,8 +1180,99 @@ const labelMap = {
   "evidence": "Доказательность"
 };
 
+function renderList(ul, items, renderItem, emptyText="Нет"){
+  ul.innerHTML = '';
+  if (!Array.isArray(items) || items.length === 0){
+    const li=document.createElement('li');
+    li.className='muted';
+    li.textContent = emptyText;
+    ul.appendChild(li);
+    return;
+  }
+  items.forEach(it => {
+    const li=document.createElement('li');
+    renderItem(li, it);
+    ul.appendChild(li);
+  });
+}
+
+function renderResult(r){
+  // Итоговый балл
+  const sc = r.score ?? '—';
+  const sb = el('score');
+  sb.textContent = 'оценка: ' + sc;
+  sb.style.background = colorForScore(typeof sc === 'number' ? sc : NaN);
+
+  // Subscores
+  const subs = el('subs'); subs.innerHTML = '';
+  const sbs = r.subscores || {};
+  if (Object.keys(sbs).length === 0){
+    const d=document.createElement('div'); d.className='muted'; d.textContent='Подсчёты отсутствуют';
+    subs.appendChild(d);
+  } else {
+    Object.entries(sbs).forEach(([k,v])=>{
+      const d=document.createElement('div'); d.className='card'; d.style.margin=0;
+      d.innerHTML=`<div class="small">${labelMap[k] || k}</div><div style="font-weight:700">${(v ?? '—')}</div>`;
+      subs.appendChild(d);
+    });
+  }
+
+  // Критические ошибки
+  renderList(el('crit'), r.critical_errors, (li,x)=>{
+    const typ = (x && x.type) ? String(x.type) : 'Ошибка';
+    const exp = (x && x.explain) ? String(x.explain) : '';
+    li.textContent = exp ? (typ + ': ' + exp) : typ;
+  });
+
+  // Рекомендации
+  renderList(el('recs'), r.recommendations, (li,x)=>{
+    const what = (x && x.what_to_change) ? String(x.what_to_change) : '—';
+    const why  = (x && x.rationale) ? String(x.rationale) : '';
+    li.textContent = why ? (what + ' — ' + why) : what;
+  });
+
+  // Цитаты
+  renderList(el('cits'), r.citations, (li,x)=>{ li.textContent = String(x); });
+
+  // Дисклеймер
+  el('disc').textContent = r.disclaimer ? String(r.disclaimer) : '';
+  el('raw').textContent = JSON.stringify(r,null,2);
+}
+
+function prettyModelName(id){
+  if (id === 'llama3.1:8b')      return 'Llama 3.1 (8B)';
+  if (id === 'llama3.1:70b')     return 'Llama 3.1 (70B)';
+  if (id === 'deepseek-r1:32b')  return 'DeepSeek R1 (32B)';
+  return id;
+}
+
+async function fillModels(){
+  try{
+    const res = await fetch(API + '/runtime/models');
+    const m = await res.json();
+    const sel = el('model');
+    sel.innerHTML = '';
+    (m.allowed || []).forEach(id => {
+      const opt = document.createElement('option');
+      opt.value = id;
+      opt.textContent = prettyModelName(id);
+      if (id === m.active) opt.selected = true;
+      sel.appendChild(opt);
+    });
+  }catch(e){
+    console.error('models fetch failed', e);
+    const sel = el('model');
+    ['llama3.1:8b','llama3.1:70b','deepseek-r1:32b'].forEach(id=>{
+      const opt = document.createElement('option');
+      opt.value = id; opt.textContent = prettyModelName(id);
+      sel.appendChild(opt);
+    });
+  }
+}
+
 async function run(){
   el('error').textContent = '';
+  el('busy').textContent = '⏳ анализ…';
   show(el('busy'), true);
   el('run').disabled = true;
 
@@ -1147,10 +1296,12 @@ async function run(){
     });
 
     const txt = await res.text();
-    let data; try{ data = JSON.parse(txt); }catch(e){
-      throw new Error('Не удалось разобрать JSON ответа: ' + txt.slice(0,200));
-    }
-    renderResult(data.result || data);
+    let data;
+    try { data = JSON.parse(txt); }
+    catch(e){ throw new Error('Не удалось разобрать JSON ответа: ' + txt.slice(0,200)); }
+
+    const payload = (data && data.result) ? data.result : data;
+    renderResult(payload || {});
   }catch(e){
     el('error').textContent = 'Ошибка: ' + (e?.message || e);
   }finally{
@@ -1158,17 +1309,19 @@ async function run(){
     el('run').disabled = false;
   }
 }
+
 el('run').onclick = run;
 
 el('reindex').onclick = async () => {
-  show(el('busy'), true);
   el('error').textContent = '';
+  el('busy').textContent = '🔄 запуск переиндексации…';
+  show(el('busy'), true);
   try {
     const res = await fetch(API + '/reindex', { method: 'POST' });
     const data = await res.json();
-    el('error').textContent = data.message || '';
+    el('error').textContent = data.message || 'Запущено.';
   } catch(e) {
-    el('error').textContent = 'Ошибка запуска: ' + e.message;
+    el('error').textContent = 'Ошибка запуска: ' + (e?.message || e);
   } finally {
     show(el('busy'), false);
   }
@@ -1191,9 +1344,14 @@ async function checkReindexStatus() {
     }
   } catch(e) { console.error(e); }
 }
-setInterval(checkReindexStatus, 3000);
+
+// Реже опрашиваем статус (уменьшает шум логов в бэкенде)
+setInterval(checkReindexStatus, 60000); // было 20000
+
+fillModels();
 </script>
 """
+
 
 @app.get("/", response_class=HTMLResponse)
 def ui_root():
@@ -1211,6 +1369,21 @@ def runtime_defaults():
         "RERANKER_ENABLED": settings.RERANKER_ENABLED,
         "RERANK_TOP_K": settings.RERANK_TOP_K,
         "HF_MODEL": settings.HF_MODEL,
+        "LLM_ACTIVE": settings.LLM_ACTIVE,
+        "LLM_ALLOWED": settings.LLM_ALLOWED,
+        "LLM_PRESETS": settings.LLM_PRESETS,
+        "LLM_BASE_URL": settings.LLM_BASE_URL,
+    }
+
+@app.get("/runtime/models")
+def runtime_models():
+    allowed = llm_get_allowed()
+    labels = llm_get_labels()
+    return {
+        "active": llm_get_active(),
+        "allowed": allowed,
+        "labels": {m: labels.get(m, m) for m in allowed},
+        "presets": {m: llm_get_preset(m) for m in allowed},
     }
 
 @app.get("/reindex/status")
@@ -1224,8 +1397,6 @@ def run_reindex(*, full: bool = False):
     import subprocess as _subprocess
     from pathlib import Path
 
-    # Продавим значения из runtime_settings.CONTROL в окружение,
-    # чтобы они стали источником правды для всех подпроцессов.
     try:
         settings.apply_env(force=True)
     except Exception:
@@ -1240,7 +1411,6 @@ def run_reindex(*, full: bool = False):
     build_bm25_py = str(base / "build_bm25.py")
     chunk_and_index_py = str(base / "chunk_and_index.py")
 
-    # ---------- helpers ----------
     def _nz(val, default):
         s = (val or "").strip() if isinstance(val, str) else val
         return s if s not in (None, "", "None") else default
@@ -1263,7 +1433,6 @@ def run_reindex(*, full: bool = False):
             return "http://localhost:7779"
         return url
 
-    # --- штамп свежести BM25 ---
     STAMP_BM25 = Path("index/.bm25_last_build")
 
     def _latest_pages_mtime() -> float:
@@ -1286,7 +1455,6 @@ def run_reindex(*, full: bool = False):
         env = _os.environ.copy()
         env["QDRANT__PREFER_GRPC"] = "false"
 
-        # --- Шаг 1: Ingest ---
         index_status.update({"state": "running", "message": "📄 Шаг 1: парсинг RAW → JSONL (инкрементально)..."})
         print("▶️ ingest_from_raw.py ...")
 
@@ -1303,7 +1471,6 @@ def run_reindex(*, full: bool = False):
 
         _subprocess.run(cmd_ingest, check=True, env=env)
 
-        # --- Резолв параметров (всё через env, выставленное settings.apply_env) ---
         qdrant_url = _normalize_qdrant_url(
             _nz(_os.getenv("QDRANT_URL") or cfg("qdrant", "url", default=settings.QDRANT_URL),
                 settings.QDRANT_URL)
@@ -1313,12 +1480,10 @@ def run_reindex(*, full: bool = False):
         emb_backend = _nz(_os.getenv("EMB_BACKEND") or cfg("embedding", "backend", default=settings.EMB_BACKEND), "hf")
         hf_model    = _nz(_os.getenv("HF_MODEL") or cfg("embedding", "model", default=settings.HF_MODEL), settings.HF_MODEL)
 
-        # Dense-чанкинг
         child_w       = _as_int(_os.getenv("CHILD_W"),       cfg("chunking", "child_w",       default=200))
         child_overlap = _as_int(_os.getenv("CHILD_OVERLAP"), cfg("chunking", "child_overlap", default=35))
         parent_w      = _as_int(_os.getenv("PARENT_W"),      cfg("chunking", "parent_w",      default=800))
 
-        # BM25-чанкинг/язык (управляется runtime_settings через ENV)
         bm25_child_w  = _as_int(_os.getenv("BM25_CHILD_W"),         _as_int(_os.getenv("CHILD_W"), 200))
         bm25_overlap  = _as_int(_os.getenv("BM25_CHILD_OVERLAP"),   _as_int(_os.getenv("CHILD_OVERLAP"), 40))
         bm25_lang     = _nz(_os.getenv("BM25_LANGUAGE"),            "ru")
@@ -1331,7 +1496,6 @@ def run_reindex(*, full: bool = False):
             f"[BM25 child_w={bm25_child_w} overlap={bm25_overlap} lang={bm25_lang}]"
         )
 
-        # --- Шаг 2: BM25 ---
         if full or _bm25_needs_rebuild():
             index_status["message"] = "📚 Шаг 2: построение/обновление BM25 индекса..."
             print("▶️ build_bm25.py ...")
@@ -1354,6 +1518,9 @@ def run_reindex(*, full: bool = False):
 
         # --- Шаг 3: Dense → Qdrant ---
         index_status["message"] = "🧠 Шаг 3: индексация в Qdrant (dense)..."
+
+        emb_batch = str(_as_int(_os.getenv("EMB_BATCH"), 128))  # читаем из ENV, дефолт 128
+
         cmd_qdr = [
             "python", chunk_and_index_py,
             "--pages-glob",    "data/*.pages.jsonl",
@@ -1361,12 +1528,13 @@ def run_reindex(*, full: bool = False):
             "--qdrant-url",    qdrant_url,
             "--emb-backend",   emb_backend,
             "--hf-model",      hf_model,
-            "--batch",         "128",
+            "--batch",         emb_batch,          # <── вот оно
             "--child-w",       str(child_w),
             "--child-overlap", str(child_overlap),
             "--parent-w",      str(parent_w),
         ]
         cmd_qdr.append("--recreate" if full else "--only-new")
+
         print("▶️ CMD:", " ".join(cmd_qdr))
         _subprocess.run(cmd_qdr, check=True, env=env)
 

@@ -63,7 +63,7 @@ services:
 
       # --- LLM (если нужен Ollama на хосте) ---
       # MODEL_ID: "llama3.1:8b"
-      # LLM_BASE_URL: "http://host.docker.internal:11434"
+      # LLM_BASE_URL: "http://ollama:11434"
 
     ports:
       - "8050:8000"

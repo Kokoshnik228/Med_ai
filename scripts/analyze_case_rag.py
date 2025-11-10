@@ -161,7 +161,7 @@ def main() -> int:
     ap.add_argument("--case", required=True, type=Path, help="Путь к кейсу .txt")
     ap.add_argument("--context", default=Path("out/context.json"), type=Path)
     ap.add_argument("--model", default="llama3.1:8b")
-    ap.add_argument("--ollama", default="http://host.docker.internal:11434")
+    ap.add_argument("--ollama", default="http://ollama:11434")
     ap.add_argument("--outdir", default=Path("out"), type=Path)
     args = ap.parse_args()
 

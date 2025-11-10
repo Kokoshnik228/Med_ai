@@ -7,7 +7,7 @@ qdrant:
   collection: med_kb_v3   # <-- новая коллекция под E5
 
 ollama:
-  base_url: http://host.docker.internal:11434
+  base_url: http://ollama:11434
   model: llama3.1:8b
 
 retrieval:

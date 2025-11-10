@@ -23,6 +23,7 @@
 """
 from __future__ import annotations
 import os
+import sys
 # ----------------- imports -----------------
 import argparse
 import numpy as np
@@ -34,7 +35,7 @@ import uuid
 import unicodedata
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set
-from rag.bm25_utils import bm25_search, retrieve_hybrid
+
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
@@ -58,6 +59,18 @@ except Exception:
 # ----------------- Константы -----------------
 MAX_EMB_CHARS_OLLAMA = 2000  # безопасный лимит для /api/embeddings
 seen_hashes_global: Set[str] = set()
+
+# ----------------- Утилиты ENV/флагов -----------------
+def _env_truthy(val: Optional[str], default: bool = False) -> bool:
+    if val is None:
+        return default
+    return val.strip().lower() in ("1", "true", "yes", "on")
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.getenv(name, str(default)))
+    except Exception:
+        return default
 
 # ----------------- Текстовые утилиты -----------------
 def _clean_jsonl_line(s: str) -> str:
@@ -93,7 +106,7 @@ def _read_pages_robust(fp: Path) -> tuple[list[dict], int]:
                     })
             except Exception as e:
                 skipped += 1
-                print(f"⚠️  {fp.name}: битая JSONL-строка #{i}: {e}")
+                print(f"⚠️  {fp.name}: битая JSONL-строка #{i}: {e}", flush=True)
     return pages, skipped
 
 def normalize_for_hash(text: str) -> str:
@@ -232,22 +245,53 @@ def ollama_embed_batch(session: requests.Session, base_url: str, model: str, tex
 class HFEmbedder:
     def __init__(self, model_name: str, device_hint: Optional[str] = None, use_fp16: bool = False):
         from FlagEmbedding import BGEM3FlagModel
-       
-        if device_hint:
-            device = device_hint
-        else:
+
+        # Прецизионка — для новых карт даёт хороший буст и экономию ОЗУ
+        if torch is not None:
+            try:
+                torch.set_float32_matmul_precision("medium")
+            except Exception:
+                pass
+
+        # Источник дефолтов: аргумент → ENV(HF_DEVICE) → auto
+        env_dev = os.getenv("HF_DEVICE", "").strip() or None
+        requested = (device_hint or env_dev or "auto").lower()
+        if requested in ("auto", ""):
             device = "cuda" if (torch and torch.cuda.is_available()) else "cpu"
-        fp16 = bool(use_fp16) or device.startswith("cuda")
-        print(f"🧠 HF embedder: {model_name} on {device} (fp16={fp16})")
-        self.model = BGEM3FlagModel(model_name, use_fp16=fp16, device=device)
-        self.default_batch = int(os.getenv("EMB_BATCH", "128") or "128")
+        else:
+            device = requested
 
+        # fp16: аргумент → ENV(HF_FP16) → auto(вкл. на cuda)
+        fp16_env = _env_truthy(os.getenv("HF_FP16"), default=False)
+        fp16 = bool(use_fp16 or fp16_env or device.startswith("cuda"))
 
-    def get_dim(self) -> int:
-        vec = self.embed_texts(["probe"])[0]
-        return len(vec)
+        # Лог девайса
+        gpu_note = ""
+        if device.startswith("cuda"):
+            if torch and torch.cuda.is_available():
+                try:
+                    gpu_note = f" | GPU={torch.cuda.get_device_name(0)}  CUDA_VISIBLE_DEVICES={os.getenv('CUDA_VISIBLE_DEVICES','<unset>')}"
+                except Exception:
+                    gpu_note = " | GPU=?"
+            else:
+                print("⚠️  Запрошен CUDA, но torch.cuda недоступен — переключаюсь на CPU.", flush=True)
+                device, fp16 = "cpu", False
 
-    def embed_texts(self, texts, batch_size: int | None = None):
+        print(f"🧠 HF embedder: {model_name} on {device} (fp16={fp16}){gpu_note}", flush=True)
+
+        # Инициализация с фолбэком на CPU при проблемах CUDA
+        try:
+            self.model = BGEM3FlagModel(model_name, use_fp16=fp16, device=device)
+        except Exception as e:
+            if device.startswith("cuda"):
+                print(f"⚠️  Не удалось инициализировать модель на CUDA ({e}). Фолбэк на CPU.", flush=True)
+                self.model = BGEM3FlagModel(model_name, use_fp16=False, device="cpu")
+            else:
+                raise
+
+        self.default_batch = _env_int("EMB_BATCH", 128)
+
+    def embed_texts(self, texts, batch_size: int | None = None) -> np.ndarray:
         """
         Возвращает np.ndarray (N, D) с плотными эмбеддингами.
         Нормализует разные форматы выдачи библиотек (dict / list / np.array).
@@ -280,18 +324,19 @@ class HFEmbedder:
         else:
             vecs = out
 
-        vecs = np.asarray(vecs)
+        vecs = np.asarray(vecs, dtype=np.float32)
         if vecs.ndim == 1:
             vecs = vecs.reshape(1, -1)
         return vecs
+
     def get_dim(self) -> int:
         vecs = self.embed_texts(["probe"], batch_size=4)
-        # vecs гарантированно np.ndarray (N, D)
         return int(vecs.shape[-1])
+
 # ----------------- Qdrant helpers -----------------
 def ensure_collection(client: QdrantClient, name: str, dim: int, recreate: bool = False) -> None:
     if recreate and client.collection_exists(name):
-        print(f"⚠️ Пересоздаём коллекцию {name}...")
+        print(f"⚠️ Пересоздаём коллекцию {name}...", flush=True)
         client.delete_collection(name)
         time.sleep(2)
     if not client.collection_exists(name):
@@ -299,6 +344,9 @@ def ensure_collection(client: QdrantClient, name: str, dim: int, recreate: bool 
             collection_name=name,
             vectors_config=VectorParams(size=dim, distance=Distance.COSINE),
         )
+        print(f"✅ Создана коллекция {name} (dim={dim}, metric=COSINE)", flush=True)
+    else:
+        print(f"ℹ️  Коллекция {name} уже существует (dim={dim})", flush=True)
 
 def fetch_existing_hashes(client: QdrantClient, collection: str, doc_id: str) -> set[str]:
     existing: set[str] = set()
@@ -333,7 +381,10 @@ def main() -> None:
     ap.add_argument("--child-w", type=int, default=150)
     ap.add_argument("--child-overlap", type=int, default=30)
     ap.add_argument("--parent-w", type=int, default=800)
-    ap.add_argument("--batch", type=int, default=256)
+
+    # batch из ENV EMB_BATCH (деф. 256 если не указан в ENV)
+    ap.add_argument("--batch", type=int, default=_env_int("EMB_BATCH", 256))
+
     ap.add_argument("--recreate", action="store_true")
     ap.add_argument("--only-new", action="store_true")
     ap.add_argument("--qdrant-wait", action="store_true")
@@ -341,15 +392,15 @@ def main() -> None:
     # Embedding backend
     ap.add_argument("--emb-backend", choices=["hf", "ollama"], default="hf")
 
-    # HF
-    ap.add_argument("--hf-model", default="BAAI/bge-m3")
-    ap.add_argument("--hf-device", default=None)      # например, cuda:0
-    ap.add_argument("--hf-fp16", action="store_true")
+    # HF (дефолты из ENV)
+    ap.add_argument("--hf-model", default=os.getenv("HF_MODEL", "BAAI/bge-m3"))
+    ap.add_argument("--hf-device", default=os.getenv("HF_DEVICE", None))      # например, cuda или cuda:0
+    ap.add_argument("--hf-fp16", action="store_true", default=_env_truthy(os.getenv("HF_FP16"), default=False))
 
     # Ollama
-    ap.add_argument("--ollama-url", default="http://localhost:11435")
-    ap.add_argument("--emb-model", default="zylonai/multilingual-e5-large:latest")
-    ap.add_argument("--timeout", type=int, default=180)
+    ap.add_argument("--ollama-url", default=os.getenv("OLLAMA_URL", "http://localhost:11435"))
+    ap.add_argument("--emb-model", default=os.getenv("EMB_MODEL", "zylonai/multilingual-e5-large:latest"))
+    ap.add_argument("--timeout", type=int, default=int(os.getenv("EMB_TIMEOUT", "180")))
 
     args = ap.parse_args()
 
@@ -358,11 +409,11 @@ def main() -> None:
         raise SystemExit(f"❌ Не найдено файлов по маске: {args.pages_glob}")
 
     # Проверка доступности Qdrant
-    print(f"🔗 Qdrant URL: {args.qdrant_url}")
+    print(f"🔗 Qdrant URL: {args.qdrant_url}", flush=True)
     try:
         test = requests.get(args.qdrant_url.rstrip("/") + "/readyz", timeout=5)
         test.raise_for_status()
-        print("✅ Qdrant доступен.")
+        print("✅ Qdrant доступен.", flush=True)
     except Exception as e:
         raise SystemExit(f"❌ Не удалось подключиться к Qdrant ({args.qdrant_url}): {e}")
 
@@ -370,12 +421,12 @@ def main() -> None:
     if args.emb_backend == "hf":
         hf = HFEmbedder(args.hf_model, device_hint=args.hf_device, use_fp16=args.hf_fp16)
         dim = hf.get_dim()
-        print(f"🔤 HF embeddings: {args.hf_model} (dim={dim})")
+        print(f"🔤 HF embeddings: {args.hf_model} (dim={dim}) | batch={args.batch}", flush=True)
         embed_fn = lambda texts: hf.embed_texts(texts, batch_size=args.batch)
     else:
         session = make_session(timeout=args.timeout)
         dim = ollama_get_dim(session, args.ollama_url, args.emb_model, args.timeout)
-        print(f"🔤 Ollama embeddings: {args.emb_model} (dim={dim}) @ {args.ollama_url}")
+        print(f"🔤 Ollama embeddings: {args.emb_model} (dim={dim}) @ {args.ollama_url} | batch={args.batch}", flush=True)
         embed_fn = lambda texts: ollama_embed_batch(session, args.ollama_url, args.emb_model, texts, args.timeout)
 
     # Qdrant коллекция
@@ -389,16 +440,16 @@ def main() -> None:
         doc_id = fp.stem.replace(".pages", "")
         pages, bad = _read_pages_robust(fp)
         if bad:
-            print(f"⚠️  {doc_id}: пропущено битых строк: {bad}")
+            print(f"⚠️  {doc_id}: пропущено битых строк: {bad}", flush=True)
 
         if not any(p.get("text") for p in pages):
-            print(f"📄 {doc_id}: нет текста (пропуск)")
+            print(f"📄 {doc_id}: нет текста (пропуск)", flush=True)
             continue
 
         # Чанкинг
         childs = build_parent_child(pages, args.child_w, args.child_overlap, args.parent_w)
         if not childs:
-            print(f"📄 {doc_id}: нет чанков (пропуск)")
+            print(f"📄 {doc_id}: нет чанков (пропуск)", flush=True)
             continue
 
         # Хэши для дедупликации
@@ -422,21 +473,27 @@ def main() -> None:
         childs = filtered
         total_childs_after_dedup += len(childs)
 
-        print(f"📄 {doc_id}: новых чанков {len(childs)}, уже существующих {skipped_existing}")
+        print(f"📄 {doc_id}: новых чанков {len(childs)}, уже существующих {skipped_existing}", flush=True)
         if not childs:
             continue
 
         # Батчевый эмбеддинг + upsert
-        for chunk in tqdm(batched(childs, args.batch), desc=f"{doc_id}"):
+        for chunk in tqdm(batched(childs, args.batch), desc=f"{doc_id}", unit="batch"):
             texts = [c["text"] for c in chunk]
             if not texts:
                 continue
 
             try:
-                emb = embed_fn(texts)
+                emb = embed_fn(texts)  # np.ndarray (N, D) или List[List[float]]
             except Exception as e:
-                print(f"⚠️ Ошибка эмбеддинга батча ({len(texts)}): {e}")
+                print(f"⚠️ Ошибка эмбеддинга батча ({len(texts)}): {e}", flush=True)
                 continue
+
+            # Нормализация к List[float] для Qdrant
+            if isinstance(emb, np.ndarray):
+                emb_rows = [row.astype(np.float32).tolist() for row in emb]
+            else:
+                emb_rows = [[float(x) for x in row] for row in emb]
 
             points: List[PointStruct] = []
             for i, c in enumerate(chunk):
@@ -449,7 +506,7 @@ def main() -> None:
                     "len_words": len(c["text"].split()),
                     "text_hash": c["text_hash"],
                 }
-                points.append(PointStruct(id=unique_id, vector=emb[i], payload=payload))
+                points.append(PointStruct(id=unique_id, vector=emb_rows[i], payload=payload))
 
             client.upsert(
                 collection_name=args.collection,
@@ -458,11 +515,11 @@ def main() -> None:
             )
             total_points_upserted += len(points)
 
-    print("📊 Итог:")
-    print(f"  Файлов обработано: {len(files)}")
-    print(f"  Новых чанков: {total_childs_after_dedup}")
-    print(f"  Добавлено/обновлено векторов: {total_points_upserted}")
-    print("✅ Индексация в Qdrant завершена.")
+    print("📊 Итог:", flush=True)
+    print(f"  Файлов обработано: {len(files)}", flush=True)
+    print(f"  Новых чанков: {total_childs_after_dedup}", flush=True)
+    print(f"  Добавлено/обновлено векторов: {total_points_upserted}", flush=True)
+    print("✅ Индексация в Qdrant завершена.", flush=True)
 
 if __name__ == "__main__":
     main()

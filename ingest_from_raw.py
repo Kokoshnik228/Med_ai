@@ -9,6 +9,8 @@ RAW (PDF/DOCX/TXT) -> data/*.pages.jsonl + data/manifest.json
   чтобы down-stream (BM25/Qdrant/цитаты) работал одинаково с PDF.
 - Инкрементальность: обрабатываем только новые/изменённые файлы (по SHA1), если НЕ указан --force.
 - EasyOCR: «тёплый старт» для скачивания моделей один раз; в воркерах скачивание отключено.
+- GPU-настройки для EasyOCR: можно принудительно задать устройство (--ocr-gpu cuda|cpu|auto),
+  путь к кэшу моделей и возможность скачивания (--easyocr-allow-downloads).
 
 Зависимости (в контейнере app):
   pip install chardet pymupdf pillow python-docx
@@ -25,7 +27,7 @@ import os
 import re
 import hashlib
 from pathlib import Path
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List
 from concurrent.futures import ProcessPoolExecutor, as_completed
 import multiprocessing as mp
 from time import perf_counter
@@ -37,7 +39,7 @@ import chardet
 try:
     import fitz  # PyMuPDF
 except Exception as e:
-    print("[ERR] Требуется PyMuPDF: pip install pymupdf", file=sys.stderr)
+    print("[ERR] Требуется PyMuPDF: pip install pymupdf", file=sys.stderr, flush=True)
     raise
 
 # python-docx==1.1.2
@@ -66,6 +68,14 @@ try:
     CV_AVAILABLE = True
 except Exception:
     CV_AVAILABLE = False
+
+# Torch для GPU-инфо (опционально; не падаем, если отсутствует)
+try:
+    import torch
+    _TORCH_OK = True
+except Exception:
+    torch = None
+    _TORCH_OK = False
 
 
 # ================== Утилиты ==================
@@ -107,6 +117,7 @@ _LATIN_TO_CYR = str.maketrans({
     "A":"А","a":"а","B":"В","E":"Е","e":"е","K":"К","k":"к","M":"М","H":"Н","O":"О","o":"о",
     "P":"Р","p":"р","C":"С","c":"с","T":"Т","X":"Х","x":"х","Y":"У","y":"у"
 })
+
 def clean_text(text: str) -> str:
     t = (text or "").replace("\r", "")
     t = re.sub(r"-\n", "", t)                                # убрать переносы со знаком дефиса
@@ -151,12 +162,12 @@ def split_text_to_pages(full_text: str, page_size_chars: int = 1800) -> List[Dic
 def extract_docx_text(path: Path) -> str:
     """Извлечь текст из DOCX (абзацы + таблицы)."""
     if Document is None:
-        print("[ERR] python-docx не установлен. Добавь `python-docx` в зависимости.", file=sys.stderr)
+        print("[ERR] python-docx не установлен. Добавь `python-docx` в зависимости.", file=sys.stderr, flush=True)
         return ""
     try:
         doc = Document(str(path))
     except Exception as e:
-        print(f"[ERR] Не удалось открыть DOCX {path.name}: {e}", file=sys.stderr)
+        print(f"[ERR] Не удалось открыть DOCX {path.name}: {e}", file=sys.stderr, flush=True)
         return ""
 
     parts: List[str] = []
@@ -189,8 +200,12 @@ def ingest_docx(path: Path, page_size_chars: int = 1800) -> List[Dict[str, Any]]
 def ocr_page_tesseract(img_pil: "Image.Image", lang: str) -> str:
     if not TESS_AVAILABLE:
         return ""
+    # NB: ограничиваем треды, чтобы не душить систему
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
     cfg = "--oem 1 --psm 6"
     return (pytesseract.image_to_string(img_pil, lang=lang, config=cfg) or "").strip()
+
 
 def ocr_page_easyocr(img_pil: "Image.Image", reader) -> str:
     if reader is None:
@@ -198,6 +213,7 @@ def ocr_page_easyocr(img_pil: "Image.Image", reader) -> str:
     arr = np.array(img_pil.convert("RGB"))
     res = reader.readtext(arr, detail=0, paragraph=True)
     return "\n".join([x.strip() for x in res if x]).strip()
+
 
 def preprocess_pil(img_pil: "Image.Image") -> "Image.Image":
     """Лёгкая предобработка для OCR (если есть OpenCV)."""
@@ -236,7 +252,7 @@ def ingest_pdf(
     try:
         doc = fitz.open(pdf_path)
     except Exception as e:
-        print(f"[WARN] Не удалось открыть PDF {pdf_path.name}: {e}", file=sys.stderr)
+        print(f"[WARN] Не удалось открыть PDF {pdf_path.name}: {e}", file=sys.stderr, flush=True)
         return pages
 
     for i, page in enumerate(doc, start=1):
@@ -274,9 +290,9 @@ def ingest_pdf(
             if len(txt_ocr) > len(txt):
                 txt = txt_ocr
                 if verbose:
-                    print(f"[OCR-{ocr_backend}] {pdf_path.name} p.{i}: len={len(txt)}")
+                    print(f"[OCR-{ocr_backend}] {pdf_path.name} p.{i}: len={len(txt)}", flush=True)
             elif verbose and ocr_mode != "never" and txt_ocr:
-                print(f"[OCR-{ocr_backend}] {pdf_path.name} p.{i}: OCR не улучшил текст (len={len(txt)})")
+                print(f"[OCR-{ocr_backend}] {pdf_path.name} p.{i}: OCR не улучшил текст (len={len(txt)})", flush=True)
 
         if txt:
             txt = clean_text(txt)
@@ -331,6 +347,7 @@ def process_one_file(
     page_size_chars: int,
     easyocr_dir: Path,
     easyocr_use_gpu: bool,
+    easyocr_allow_downloads: bool,
 ) -> Dict[str, Any]:
     """Процессинг одного файла (без доступа к manifest). Возвращает entry + путь pages."""
     sha = file_sha1(f)
@@ -338,14 +355,14 @@ def process_one_file(
     doc_id = stem  # уникализацию по doc_id решаем на верхнем уровне, если потребуется
     out_pages = out_dir / f"{doc_id}.pages.jsonl"
 
-    # OCR init (EasyOCR в этом процессе; скачивания не допускаем)
+    # OCR init (EasyOCR в этом процессе; скачивания по флагу)
     easy_reader = None
     if ocr_mode != "never" and ocr_backend_eff == "easyocr":
         easy_reader = easyocr.Reader(
             ['ru', 'en'],
             gpu=easyocr_use_gpu,
             model_storage_directory=str(easyocr_dir),
-            download_enabled=False,
+            download_enabled=bool(easyocr_allow_downloads),
             verbose=False,
         )
 
@@ -385,6 +402,17 @@ def process_one_file(
     }
 
 
+def _decide_easyocr_gpu(ocr_gpu_arg: str) -> bool:
+    """Возвращает True если следует использовать GPU для EasyOCR."""
+    ocr_gpu_arg = (ocr_gpu_arg or "auto").lower()
+    if ocr_gpu_arg == "cuda":
+        return _TORCH_OK and torch.cuda.is_available()
+    if ocr_gpu_arg == "cpu":
+        return False
+    # auto
+    return _TORCH_OK and torch.cuda.is_available()
+
+
 def main():
     ap = argparse.ArgumentParser("RAW -> data/*.pages.jsonl (+manifest) с OCR и поддержкой DOCX/TXT")
     ap.add_argument("--input-dir", default="raw_docs", help="Папка с PDF/DOCX/TXT (рекурсивно)")
@@ -400,6 +428,15 @@ def main():
     ap.add_argument("--min-chars", type=int, default=int(os.getenv("MIN_CHARS", "60")),
                     help="Порог символов для запуска OCR в режиме auto")
     ap.add_argument("--dpi", type=int, default=int(os.getenv("OCR_DPI", "300")), help="DPI рендера для tesseract")
+
+    # EasyOCR/GPU
+    ap.add_argument("--ocr-gpu", choices=["auto","cpu","cuda"], default=os.getenv("OCR_GPU", "auto"),
+                    help="Устройство для EasyOCR (auto/cpu/cuda)")
+    ap.add_argument("--easyocr-dir", default=os.getenv("EASYOCR_DIR", str(Path.home() / ".EasyOCR")),
+                    help="Каталог для моделей EasyOCR")
+    ap.add_argument("--easyocr-allow-downloads", action="store_true",
+                    default=os.getenv("EASYOCR_ALLOW_DOWNLOADS", "0").lower() in ("1","true","yes"),
+                    help="Разрешить скачивание моделей EasyOCR в этом запуске")
 
     # Прочее
     ap.add_argument("--workers", type=int, default=0, help="Параллелизм по файлам (0=CPU count)")
@@ -428,7 +465,7 @@ def main():
     files = sorted(files)
 
     if not files:
-        print(f"В {in_dir} нет pdf/docx/txt", file=sys.stderr)
+        print(f"В {in_dir} нет pdf/docx/txt", file=sys.stderr, flush=True)
         return 1
 
     manifest_path = out_dir / "manifest.json"
@@ -457,10 +494,10 @@ def main():
                 rel = f.relative_to(in_dir)
             except Exception:
                 rel = f
-            print(f"→ Без изменений: {rel}")
+            print(f"→ Без изменений: {rel}", flush=True)
 
     if not plan:
-        print("Нет изменений — ничего делать не нужно.")
+        print("Нет изменений — ничего делать не нужно.", flush=True)
         return 0
 
     # Эффективный OCR backend с учётом установленного
@@ -468,27 +505,22 @@ def main():
     if ocr_backend_eff == "none":
         args.ocr_mode = "never"
 
-    easyocr_dir = Path(os.getenv("EASYOCR_DIR", str(Path.home() / ".EasyOCR"))).expanduser()
+    easyocr_dir = Path(args.easyocr_dir).expanduser()
     ensure_dir(easyocr_dir / "model")
 
-    # Если нужен easyocr и моделей ещё нет – делаем «тёплый старт» (однопроцессно)
+    # EasyOCR warmup: если нужно и моделей ещё нет
     need_easy_warmup = (
         args.ocr_mode != "never"
         and ocr_backend_eff == "easyocr"
         and not _easyocr_models_ready(easyocr_dir)
     )
     if need_easy_warmup:
-        print("⏳ EasyOCR warmup: загрузка моделей (один раз)...")
-        use_gpu = False
-        try:
-            import torch
-            use_gpu = torch.cuda.is_available()
-        except Exception:
-            pass
-        # Разрешаем скачивание РОВНО один раз
+        print("⏳ EasyOCR warmup: загрузка моделей (один раз)...", flush=True)
+        use_gpu = _decide_easyocr_gpu(args.ocr_gpu)
+        # Загрузка моделей один раз (по флагу)
         easyocr.Reader(['ru','en'], gpu=use_gpu,
                        model_storage_directory=str(easyocr_dir),
-                       download_enabled=True,
+                       download_enabled=bool(args.easyocr_allow_downloads),
                        verbose=False)
         # первый прогон — без параллелизма (исключаем гонки)
         args.workers = 1
@@ -496,21 +528,17 @@ def main():
     # Параллелизм по файлам
     workers = args.workers or max(1, os.cpu_count() or 1)
 
-    # Если EasyOCR — предпочитаем одиночный процесс, чтобы дать CUDA работать
+    # Если EasyOCR — предпочитаем одиночный процесс, чтобы дать CUDA работать стабильно
     easyocr_use_gpu = False
     if args.ocr_mode != "never" and ocr_backend_eff == "easyocr":
         if workers > 1:
-            print("⚠️ EasyOCR: переключаюсь на workers=1 для стабильности и GPU.")
+            print("⚠️ EasyOCR: переключаюсь на workers=1 для стабильности и GPU.", flush=True)
             workers = 1
-        try:
-            import torch
-            easyocr_use_gpu = torch.cuda.is_available()
-        except Exception:
-            easyocr_use_gpu = False
-        print(f"EasyOCR init планируется с GPU={easyocr_use_gpu}")
+        easyocr_use_gpu = _decide_easyocr_gpu(args.ocr_gpu)
+        print(f"EasyOCR init планируется с GPU={easyocr_use_gpu}", flush=True)
 
     total = len(plan)
-    print(f"📦 Ingest started: {total} files (workers={workers}, ocr={args.ocr_mode}/{ocr_backend_eff})")
+    print(f"📦 Ingest started: {total} files (workers={workers}, ocr={args.ocr_mode}/{ocr_backend_eff})", flush=True)
 
     results: List[Dict[str, Any]] = []
     t_start = perf_counter()
@@ -530,12 +558,13 @@ def main():
                     page_size_chars=args.page_size_chars,
                     easyocr_dir=easyocr_dir,
                     easyocr_use_gpu=easyocr_use_gpu,
+                    easyocr_allow_downloads=False,  # в рабочих процессах по умолчанию не качаем
                 )
                 results.append(r)
                 dt = perf_counter() - t0
-                print(f"[{i}/{total}] {f.name}: {r['pages']} pages, empty={r['empty_pages']}, ocr={r['ocr_backend']}/{r['ocr_mode']} ({dt:.2f}s)")
+                print(f"[{i}/{total}] {f.name}: {r['pages']} pages, empty={r['empty_pages']}, ocr={r['ocr_backend']}/{r['ocr_mode']} ({dt:.2f}s)", flush=True)
             except Exception as e:
-                print(f"[ERR] {f.name}: {e}", file=sys.stderr)
+                print(f"[ERR] {f.name}: {e}", file=sys.stderr, flush=True)
     else:
         mp_ctx = mp.get_context("spawn")
         with ProcessPoolExecutor(max_workers=workers, mp_context=mp_ctx) as ex:
@@ -551,6 +580,7 @@ def main():
                     page_size_chars=args.page_size_chars,
                     easyocr_dir=easyocr_dir,
                     easyocr_use_gpu=False,  # в мультипроцессе — без CUDA
+                    easyocr_allow_downloads=False,
                 ): f for f in plan
             }
             done = 0
@@ -560,9 +590,9 @@ def main():
                     r = fut.result()
                     results.append(r)
                     done += 1
-                    print(f"[{done}/{total}] {f.name}: {r['pages']} pages, empty={r['empty_pages']}, ocr={r['ocr_backend']}/{r['ocr_mode']}")
+                    print(f"[{done}/{total}] {f.name}: {r['pages']} pages, empty={r['empty_pages']}, ocr={r['ocr_backend']}/{r['ocr_mode']}", flush=True)
                 except Exception as e:
-                    print(f"[ERR] {f.name}: {e}", file=sys.stderr)
+                    print(f"[ERR] {f.name}: {e}", file=sys.stderr, flush=True)
 
     # Обновляем manifest и уникализируем doc_id при коллизии
     for r in results:
@@ -609,7 +639,7 @@ def main():
 
     manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     total_dt = perf_counter() - t_start
-    print(f"\nГотово ✅: обработано файлов = {len(results)} за {total_dt:.2f}s. Обновлён {manifest_path}")
+    print(f"\nГотово ✅: обработано файлов = {len(results)} за {total_dt:.2f}s. Обновлён {manifest_path}", flush=True)
     return 0
 
 

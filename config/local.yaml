@@ -2,7 +2,7 @@ qdrant:
   url: "qdrant:6333"        # было localhost:7777? — заменяем
   collection: "med_kb_v3"          # было med_kb_v2? — заменяем
 ollama:
-  base_url: "http://host.docker.internal:11434"
+  base_url: "http://ollama:11434"
 embedding:
   backend: "hf"
   hf_model: "BAAI/bge-m3"

@@ -75,9 +75,12 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Анализ клинического кейса через Ollama")
     parser.add_argument("case_file", type=Path, help="Путь к текстовому файлу кейса (.txt)")
     parser.add_argument("--model", default="llama3.1:8b", help="ID модели Ollama (например, llama3.1:8b или llama3.1:70b)")
-    parser.add_argument("--host", default="http://host.docker.internal:11434", help="База URL сервера Ollama")
+    parser.add_argument("--host", default="http://ollama:11434", help="База URL сервера Ollama")
     parser.add_argument("--num_ctx", type=int, default=8192, help="Контекст (токены)")
     parser.add_argument("--temperature", type=float, default=0.0, help="Температура генерации")
+    parser.add_argument("--device", default=None, choices=["auto","cpu","cuda"], help="Force device")
+    parser.add_argument("--fp16", action="store_true", help="Use FP16 on CUDA")
+
     args = parser.parse_args()
 
     if not args.case_file.exists():

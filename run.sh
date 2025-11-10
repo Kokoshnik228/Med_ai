@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -Eeuo pipefail
 
 MODE="${1:-}"
 ACTION="${2:-up}"
@@ -29,26 +29,26 @@ usage() {
   ./run.sh dev set-gpu auto     # Авто: если есть nvidia, включит gpu
 
   # Дополнительно
-  ./run.sh dev health           # Пинг http://localhost:7050/health
+  ./run.sh dev health           # Пинг http://srv-ai:7050/health
   ./run.sh prod pull            # docker compose pull
   ./run.sh prod build           # docker compose build
   ./run.sh prod down-v          # down -v (сносит volume’ы)
 EOF
 }
 
-if [[ -z "$MODE" ]]; then usage; exit 1; fi
+[[ -z "$MODE" ]] && { usage; exit 1; }
 
 case "$MODE" in
   dev)
     COMPOSE_FILE="docker-compose.dev.yml"
     ENV_FILE=".env.dev"
-    URL_HINT="http://localhost:7050"
+    APP_URL="${APP_URL:-http://srv-ai:7050}"
     APP_SERVICE="app"
     ;;
   prod)
     COMPOSE_FILE="docker-compose.prod.yml"
     ENV_FILE=".env.prod"
-    URL_HINT="http://localhost:8050"
+    APP_URL="${APP_URL:-http://srv-ai:8050}"
     APP_SERVICE="app"
     ;;
   *)
@@ -68,7 +68,6 @@ else
   exit 1
 fi
 
-# Проверим, поддерживается ли флаг --ansi (в некоторых версиях его нет)
 compose_supports_ansi() {
   "${DCMD[@]}" up --help 2>/dev/null | grep -q -- '--ansi' || return 1
 }
@@ -79,58 +78,61 @@ fi
 
 # ---------- helpers для .env ----------
 _sed_in_place() {
-  local file="$1"; shift
-  if sed --version >/dev/null 2>&1; then
+  local file="${1:-}"; shift || true
+  if command -v sed >/dev/null 2>&1 && sed --version >/dev/null 2>&1; then
     sed -i "$@" "$file"        # GNU sed
   else
     sed -i '' "$@" "$file"     # BSD/macOS sed
   fi
 }
 
-_escape_regex() { printf '%s' "$1" | sed -e 's/[.[\*^$\/|&()-]/\\&/g'; }
+_escape_regex() { printf '%s' "${1:-}" | sed -e 's/[.[\*^$\/|&()-]/\\&/g'; }
 
 # безопасная подстановка key=val (создаём ключ, если его нет)
 set_kv() {
-  local file="$1" key="$2" val="$3"
-  local key_re="$(_escape_regex "$key")"
+  local file="${1:-}" key="${2:-}" val="${3-}"
+  [[ -z "${file}" || -z "${key}" ]] && return 0
+  local key_re
+  key_re="$(_escape_regex "$key")"
   if grep -Eq "^[[:space:]]*${key_re}[[:space:]]*=" "$file"; then
     _sed_in_place "$file" "s|^[[:space:]]*${key_re}[[:space:]]*=.*$|${key}=${val}|g"
   else
     echo "${key}=${val}" >> "$file"
   fi
+  return 0
 }
 
-# чтение значения (игнор комментов, пробелы вокруг '='); берём последнее
+# чтение значения; всегда возвращает 0 (чтобы не падать при set -e -u)
 get_kv() {
-  local file="$1" key="$2"
+  local file="${1:-}" key="${2:-}"
+  [[ -z "${file}" || -z "${key}" ]] && { echo ""; return 0; }
   awk -F= -v k="$key" '
     $0 !~ /^[[:space:]]*#/ && $1==k { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); v=$2 }
     END{ if (v!="") print v }
   ' "$file"
+  return 0
 }
 
 print_embed_config() {
-  local file="$1"
+  local file="${1:-}"
   local backend hf_model
-  backend="$(get_kv "$file" "EMB_BACKEND" || true)"
-  hf_model="$(get_kv "$file" "HF_MODEL" || true)"
+  backend="$(get_kv "$file" "EMB_BACKEND")"
+  hf_model="$(get_kv "$file" "HF_MODEL")"
   echo "🔧 EMB_BACKEND = ${backend:-<не задан>}"
   echo "   HF_MODEL    = ${hf_model:-BAAI/bge-m3 (по умолчанию)}"
 }
 
 ensure_defaults() {
-  local file="$1"
+  local file="${1:-}"
   local backend hf_model
-  backend="$(get_kv "$file" "EMB_BACKEND" || true)"
-  if [[ -z "${backend:-}" ]]; then
-    set_kv "$file" "EMB_BACKEND" "hf"
-  fi
-  hf_model="$(get_kv "$file" "HF_MODEL" || true)"
-  [[ -n "$hf_model" ]] || set_kv "$file" "HF_MODEL" "BAAI/bge-m3"
+  backend="$(get_kv "$file" "EMB_BACKEND")"
+  [[ -n "${backend:-}" ]] || set_kv "$file" "EMB_BACKEND" "hf"
+  hf_model="$(get_kv "$file" "HF_MODEL")"
+  [[ -n "${hf_model:-}" ]] || set_kv "$file" "HF_MODEL" "BAAI/bge-m3"
 }
 
 set_emb_backend() {
-  local file="$1" backend="$2"
+  local file="${1:-}" backend="${2:-}"
   case "$backend" in
     hf)
       set_kv "$file" "EMB_BACKEND" "hf"
@@ -143,7 +145,6 @@ set_emb_backend() {
 }
 
 detect_gpu() {
-  # 0 = успех (есть nvidia), 1 = нет
   if command -v nvidia-smi >/dev/null 2>&1; then return 0; fi
   if command -v docker >/dev/null 2>&1; then
     if docker info --format '{{json .Runtimes.nvidia}}' 2>/dev/null | grep -qv 'null'; then
@@ -154,7 +155,7 @@ detect_gpu() {
 }
 
 set_gpu_profile() {
-  local file="$1" mode="$2"
+  local file="${1:-}" mode="${2:-}"
   case "$mode" in
     on)
       set_kv "$file" "COMPOSE_PROFILES" "gpu"
@@ -162,7 +163,7 @@ set_gpu_profile() {
       ;;
     off)
       set_kv "$file" "COMPOSE_PROFILES" ""
-      echo "✅ Выключены compose-профили (COMPOSE_PROFILES очищен) в ${file}"
+      echo "✅ Профили очищены в ${file}"
       ;;
     auto)
       if detect_gpu; then
@@ -179,12 +180,13 @@ set_gpu_profile() {
 }
 
 print_profiles_hint() {
-  local file="$1"
-  local prof="$(get_kv "$file" "COMPOSE_PROFILES" || true)"
-  echo "   COMPOSE_PROFILES = ${prof:-<пусто>} (gpu-профиль включай через: ./run.sh ${MODE} set-gpu on)"
+  local file="${1:-}"
+  local prof
+  prof="$(get_kv "$file" "COMPOSE_PROFILES" 2>/dev/null || echo "")"
+  echo "   COMPOSE_PROFILES = ${prof:-<пусто>} (gpu-профиль включай: ./run.sh ${MODE} set-gpu on)"
 }
 
-# ---------- действия чисто для env / set-emb / set-gpu ----------
+# ---------- быстрые действия env / set-emb / set-gpu ----------
 case "$ACTION" in
   env)
     echo "📄 Просмотр конфигурации эмбеддинга для $MODE ($ENV_FILE)"
@@ -217,20 +219,13 @@ print_embed_config "$ENV_FILE"
 print_profiles_hint "$ENV_FILE"
 echo
 
-# Прочитаем COMPOSE_PROFILES из env-файла и экспортнём в окружение CLI,
-# чтобы профиль гарантированно применился.
-CURRENT_PROFILES="$(get_kv "$ENV_FILE" "COMPOSE_PROFILES" || true || printf '')"
+# Экспорт профилей из env-файла (без падений)
+CURRENT_PROFILES="$(get_kv "$ENV_FILE" "COMPOSE_PROFILES" 2>/dev/null || echo "")"
 if [[ -n "${CURRENT_PROFILES:-}" ]]; then
   export COMPOSE_PROFILES="${CURRENT_PROFILES}"
 else
   unset COMPOSE_PROFILES || true
 fi
-
-# URL для health
-case "$MODE" in
-  dev)  APP_URL="${APP_URL:-http://localhost:7050}" ;;
-  prod) APP_URL="${APP_URL:-http://localhost:8050}" ;;
-esac
 
 _has_jq() { command -v jq >/dev/null 2>&1; }
 
@@ -242,7 +237,7 @@ case "$ACTION" in
     else
       "${DCMD[@]}" -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d --build --remove-orphans "${ANSI_FLAGS[@]}"
     fi
-    echo "⏳ Проверка здоровья сервиса..."
+    echo "⏳ Проверка здоровья сервиса (${APP_URL%/}/health)..."
     if command -v curl >/dev/null 2>&1; then
       if _has_jq; then
         curl -fsS "${APP_URL%/}/health" | jq . || true
