@@ -197,27 +197,10 @@ def load_config() -> Dict[str, Any]:
         },
         "chunking": {"child_w": 200, "child_overlap": 35, "parent_w": 800},
         "prompt": {
-            "system": (
-                "Ты — медицинский ассистент. ОТВЕЧАЙ ТОЛЬКО НА РУССКОМ ЯЗЫКЕ. "
-                "Анализируй текст как врачебный кейс: в нём могут быть жалобы, анамнез, осмотр, диагноз и назначения. "
-                "Распознай диагноз и предложенные меры, сопоставь их с контекстом базы знаний. "
-                "Не повторяй за врачем слово в слово, ты должен только дополнять его речь. "
-                "Верни СТРОГО ВАЛИДНЫЙ JSON со схемой:\n"
-                "{score, subscores, critical_errors[], recommendations[], citations[], disclaimer}\n"
-                "- score: число 0..100 (точность назначения).\n"
-                "- subscores: карта подоценок (например: dosing, diagnosis_match, interactions…).\n"
-                "- critical_errors: список объектов {type, explain}.\n"
-                "- recommendations: список объектов {what_to_change, rationale}.\n"
-                "- citations: список строк-источников только из переданного КОНТЕКСТА.\n"
-                "- disclaimer: короткое предупреждение на русском.\n"
-                "Если уверенности нет — снижай score, добавляй пояснение в disclaimer. ВНЕШНИЕ источники не используй."
-            ),
-            "user_template": (
-                "[КЕЙС]\n{case_text}\n\n"
-                "[КОНТЕКСТ]\n{ctx}\n\n"
-                "Верни ТОЛЬКО один валидный JSON по указанной схеме.Без Markdown. Все тексты внутри — на русском. "
-                "Источники указывай только из контекста. Без поясняющего текста вокруг."
-            ),
+            
+                "system": os.getenv("PROMPT_SYSTEM", getattr(settings, "PROMPT_SYSTEM", "")),
+                "user_template": os.getenv("PROMPT_USER_TPL", getattr(settings, "PROMPT_USER_TPL", "")),
+            
         },
     }
 
@@ -396,59 +379,213 @@ def safe_json_extract(s: str) -> Dict[str, Any]:
 
     return _default()
 
-def normalize_result(r: Dict[str, Any]) -> Dict[str, Any]:
-    out: Dict[str, Any] = {
-        "score": 0, "subscores": {}, "critical_errors": [], "recommendations": [],
-        "citations": [], "disclaimer": ""
-    }
+# --- helpers для очистки и извлечения текста/JSON --------------------------------
+
+_CODE_BLOCK_RE = re.compile(r"```[a-zA-Z0-9_+\-]*\s*([\s\S]*?)```", flags=re.DOTALL)
+
+def _strip_code_fences_strict(s: str) -> str:
+    """Удаляет полноценный ```блок``` если он целиком; иначе возвращает как есть."""
+    if not s:
+        return ""
+    m = _CODE_BLOCK_RE.search(s)
+    return m.group(1).strip() if m else s.strip()
+
+def _strip_code_fences_loose(s: str) -> str:
+    """
+    Удаляет даже НЕЗАКРЫТЫЕ начала кода: '```json\\n...' → текст без заголовка,
+    а также срезает хвостовые случайные обратные кавычки.
+    """
+    if not s:
+        return ""
+    s = s.replace("\r", "").lstrip()
+    if s.startswith("```"):
+        p = s.find("\n")
+        s = s[p + 1:] if p != -1 else ""
+    s = s.rstrip("`").rstrip()
+    return s
+
+def _clean_free_text(s: str) -> str:
+    """Чистый человеческий текст: без ```фенсов```, без мусора по краям."""
+    if not s:
+        return ""
+    t = _strip_code_fences_strict(s)
+    if "```" in t:
+        t = _strip_code_fences_loose(t)
+    # убираем одиночные кавычки/бектики по краям
+    t = t.strip().strip("`").strip()
+    return t
+
+def _try_parse_json_from_text(s: str):
+    """Пробуем извлечь JSON из текста (в т.ч. внутри ```json ... ``` или просто { ... })."""
+    if not s:
+        return None
+    t = _strip_code_fences_strict(s)
+    if t == s:
+        t = _strip_code_fences_loose(t)
+    t = t.strip()
+
+    # прямой parse
     try:
-        sc = r.get("score", 0) if isinstance(r, dict) else 0
-        out["score"] = max(0, min(100, float(sc))) if isinstance(sc, (int, float)) else 0.0
+        return json.loads(t)
     except Exception:
-        out["score"] = 0.0
+        pass
 
-    subs = r.get("subscores") if isinstance(r, dict) else {}
-    if isinstance(subs, dict):
-        clean = {}
-        for k, v in subs.items():
-            try:
-                clean[str(k)] = max(0, min(100, float(v)))
-            except Exception:
-                pass
-        out["subscores"] = clean
+    # вырезать первую {...} «скобочную» область
+    start = t.find("{")
+    end = t.rfind("}")
+    if start != -1 and end > start:
+        candidate = t[start:end + 1]
+        try:
+            return json.loads(candidate)
+        except Exception:
+            pass
+    return None
 
-    ce = r.get("critical_errors") if isinstance(r, dict) else []
-    clean_ce = []
+def _extract_any_text(resp) -> str:
+    """Достаём любой текст из словаря-ответа модели (raw_stream/raw_block/response/... )."""
+    if isinstance(resp, str):
+        return resp
+    if isinstance(resp, dict):
+        for key in ("raw_stream", "raw_block", "response", "text", "message", "content"):
+            v = resp.get(key)
+            if isinstance(v, str) and v.strip():
+                return v
+    return ""
+
+def _norm_critical_errors(ce) -> list[dict]:
+    """Нормализация списка крит.ошибок к [{type, explain}]"""
+    out = []
     if isinstance(ce, list):
-        for it in ce:
-            if isinstance(it, dict):
-                clean_ce.append({"type": str(it.get("type", "general")),
-                                 "explain": str(it.get("explain", it.get("message", "")))})
-            elif isinstance(it, str):
-                clean_ce.append({"type": "general", "explain": it})
-    out["critical_errors"] = clean_ce
+        for item in ce:
+            if isinstance(item, dict):
+                t = str(item.get("type", "")).strip()
+                e = str(item.get("explain", "")).strip()
+                if t or e:
+                    out.append({"type": t, "explain": e})
+            elif isinstance(item, str) and item.strip():
+                out.append({"type": "", "explain": item.strip()})
+    elif isinstance(ce, str) and ce.strip():
+        out.append({"type": "", "explain": ce.strip()})
+    return out
 
-    recs = r.get("recommendations") if isinstance(r, dict) else []
-    clean_recs = []
-    if isinstance(recs, list):
-        for it in recs:
-            if isinstance(it, dict):
-                w = str(it.get("what_to_change") or it.get("action") or it.get("recommendation") or it.get("text", ""))
-                ra = str(it.get("rationale") or it.get("reason", ""))
-                if w or ra:
-                    clean_recs.append({"what_to_change": w, "rationale": ra})
-            elif isinstance(it, str):
-                clean_recs.append({"what_to_change": it, "rationale": ""})
-    out["recommendations"] = clean_recs
+def _norm_recommendations(rec) -> list[str]:
+    """
+    Нормализуем рекомендации в список строк.
+    Чистим кодовые блоки/мусор внутри строк. Не дублируем пустяки.
+    """
+    items: list[str] = []
+    if isinstance(rec, str):
+        r = _clean_free_text(rec)
+        if r:
+            items = [r]
+    elif isinstance(rec, list):
+        for x in rec:
+            if isinstance(x, str):
+                r = _clean_free_text(x)
+                if r:
+                    items.append(r)
+            elif isinstance(x, dict):
+                wt = str(x.get("what_to_change", "")).strip()
+                rn = str(x.get("rationale", "")).strip()
+                s = f"{wt} — {rn}" if wt and rn else (wt or rn)
+                s = _clean_free_text(s)
+                if s:
+                    items.append(s)
+            else:
+                try:
+                    items.append(json.dumps(x, ensure_ascii=False))
+                except Exception:
+                    pass
+    elif rec is not None:
+        try:
+            s = json.dumps(rec, ensure_ascii=False)
+            s = _clean_free_text(s)
+            if s:
+                items = [s]
+        except Exception:
+            pass
 
-    cits = r.get("citations") if isinstance(r, dict) else []
-    if isinstance(cits, list):
-        out["citations"] = [str(x) for x in cits if isinstance(x, (str, int, float))]
-    elif isinstance(cits, (str, int, float)):
-        out["citations"] = [str(cits)]
+    # dedup + фильтр пустых
+    seen = set()
+    out = []
+    for it in items:
+        t = (it or "").strip()
+        if t and t not in seen:
+            out.append(t)
+            seen.add(t)
+    return out
 
-    disc = r.get("disclaimer") if isinstance(r, dict) else ""
-    out["disclaimer"] = str(disc) if disc is not None else ""
+# --- основная функция -----------------------------------------------------------
+
+def normalize_result_loose(resp: dict | str) -> dict:
+    """
+    Мягкая схема:
+      - critical_errors: list[{type, explain}]
+      - recommendations: [str] (если были в ответе/JSON; не тянем их из «свободного текста»)
+      - free_text: str (любой не-JSON контент модели, очищенный от ``` и мусора)
+      - meta: dict (опционально), например meta.role = 'медицинский ассистент'
+      - citations/disclaimer могут быть, но не обязательны
+    """
+    out = {
+        "critical_errors": [],
+        "recommendations": [],
+        "citations": [],
+        "disclaimer": "",
+        "meta": {},
+        "free_text": ""
+    }
+
+    # --- вариант: пришла просто строка
+    if isinstance(resp, str):
+        parsed = _try_parse_json_from_text(resp)
+        if isinstance(parsed, dict):
+            out["critical_errors"] = _norm_critical_errors(parsed.get("critical_errors"))
+            out["recommendations"] = _norm_recommendations(parsed.get("recommendations"))
+            if isinstance(parsed.get("meta"), dict):
+                out["meta"] = dict(parsed["meta"])
+            if isinstance(parsed.get("citations"), list):
+                out["citations"] = [str(x) for x in parsed["citations"] if x]
+            if isinstance(parsed.get("disclaimer"), str):
+                out["disclaimer"] = parsed["disclaimer"]
+        else:
+            out["free_text"] = _clean_free_text(resp)
+        return out
+
+    # --- вариант: пришёл словарь
+    if not isinstance(resp, dict):
+        return out
+
+    # 1) критические ошибки / рекомендации — только из «структурных» полей
+    out["critical_errors"] = _norm_critical_errors(resp.get("critical_errors"))
+    out["recommendations"] = _norm_recommendations(resp.get("recommendations"))
+
+    # 2) meta/citations/disclaimer — по возможности
+    if isinstance(resp.get("meta"), dict):
+        out["meta"] = dict(resp["meta"])
+    if isinstance(resp.get("citations"), list):
+        out["citations"] = [str(x) for x in resp["citations"] if x]
+    if isinstance(resp.get("disclaimer"), str):
+        out["disclaimer"] = resp["disclaimer"]
+
+    # 3) свободный текст — из любых «сырьевых» ключей
+    raw_txt = _extract_any_text(resp)
+    if raw_txt:
+        # Если там на самом деле лежит JSON — попробуем вытащить структурные поля
+        parsed = _try_parse_json_from_text(raw_txt)
+        if isinstance(parsed, dict):
+            # дозаполняем рекомендации/крит.ошибки только если их не было
+            if not out["recommendations"]:
+                out["recommendations"] = _norm_recommendations(parsed.get("recommendations"))
+            if not out["critical_errors"]:
+                out["critical_errors"] = _norm_critical_errors(parsed.get("critical_errors"))
+            # free_text всё равно оставим «человеческим»
+            free = (
+                str(parsed.get("answer") or parsed.get("text") or parsed.get("message") or "").strip()
+            )
+            out["free_text"] = _clean_free_text(free) if free else _clean_free_text(raw_txt)
+        else:
+            out["free_text"] = _clean_free_text(raw_txt)
+
     return out
 
 def _ns_to_ms(ns: int) -> int:
@@ -532,7 +669,7 @@ def call_ollama_json(
     user_prompt: str,
     *,
     connect_timeout_s: float = 3.0,
-    read_timeout_s: float = 180.0,
+    read_timeout_s: float = 90.0,
     stream_chunk_timeout_s: float = 30.0,
     num_ctx: int = 6144,
     num_predict: int = 160,
@@ -542,31 +679,9 @@ def call_ollama_json(
     keep_alive: Optional[str] = None,
     **_ignored_kwargs,
 ) -> Dict[str, Any]:
-    """
-    Алгоритм:
-      1) Пытаемся стримить (при необходимости с format=json).
-      2) Если пришло не-JSON → делаем блокирующий вызов с format=json и теми же параметрами.
-      3) Возвращаем нормализованный JSON из safe_json_extract2.
-    """
     try:
-        import os as _os
-        import json as _json
-        import time as _time
-
-        def _looks_like_json(s: str) -> bool:
-            try:
-                _json.loads(s)
-                return True
-            except Exception:
-                return False
-
-        t0 = _time.perf_counter()
-
         if not ollama_url:
             ollama_url = "http://ollama:11434"
-
-        # Флаг принудительного JSON в стриме (берём из рантайма/ENV)
-        enforce_json_stream = str(_os.getenv("LLM_ENFORCE_JSON_STREAM", "0")).strip().lower() in {"1","true","t","yes","y","on"}
 
         bad = {"gpu_layers", "num_gpu", "main_gpu"}
         opts = {
@@ -588,13 +703,9 @@ def call_ollama_json(
         if keep_alive is not None:
             base_payload["keep_alive"] = keep_alive
 
-        print(
-            f"LLM STREAM: url={ollama_url} model={model} "
-            f"timeouts(connect={connect_timeout_s}s, read={read_timeout_s}s, chunk={stream_chunk_timeout_s}s) "
-            f"ctx={opts.get('num_ctx')} max_tokens={opts.get('num_predict')}"
-        )
+        raw_stream_text = ""
 
-        # 1) STREAM-FIRST
+        # 1) STREAM-FIRST (без format=json)
         try:
             print("LLM STREAM: start")
             text = _ollama_generate_stream(
@@ -602,30 +713,36 @@ def call_ollama_json(
                 base_payload,
                 per_chunk_timeout_s=stream_chunk_timeout_s,
                 connect_timeout_s=connect_timeout_s,
-                enforce_json_on_stream=bool(enforce_json_stream),
+                enforce_json_on_stream=False,
             )
-            t1 = _time.perf_counter()
             text = _trim_code_fences2(text)
+            raw_stream_text = text or ""
             if text:
-                print(f"LLM STREAM: done in {int((t1 - t0)*1000)}ms, {len(text)} chars")
-                if _looks_like_json(text):
-                    return safe_json_extract2(text)
+                parsed = safe_json_extract2(text)
+                if isinstance(parsed, dict) and parsed:
+                    # даже если JSON распарсился, оставим оригинал
+                    parsed.setdefault("raw_stream", raw_stream_text)
+                    return parsed
                 else:
-                    print("LLM STREAM: non-JSON — switching to blocking JSON call")
+                    # не JSON: попробуем блокирующий fallback, но raw_stream обязательно вернём
+                    print("LLM STREAM: got non-JSON or unparseable JSON → fallback to blocking format=json")
             else:
-                print("LLM STREAM: empty stream result — switching to blocking JSON call")
+                print("LLM STREAM: empty stream result")
         except _requests.exceptions.ReadTimeout:
-            print(f"LLM STREAM: ReadTimeout (chunk {stream_chunk_timeout_s}s), fallback to blocking")
+            print(f"LLM STREAM: ReadTimeout (chunk {stream_chunk_timeout_s}s), fallback to short blocking call")
         except Exception as e:
             print(f"LLM STREAM: error={type(e).__name__}: {e}, fallback to blocking")
 
-        # 2) Блокирующая попытка c format=json (БЕЗ урезания num_predict)
-        block_payload = dict(base_payload)
-        block_payload["format"] = "json"
+        # 2) Короткая блокирующая попытка c format=json
+        short_payload = dict(base_payload)
+        short_opts = dict(opts)
+        short_opts["num_predict"] = min(80, int(opts.get("num_predict", 120)))
+        short_payload["options"] = short_opts
+        short_payload["format"] = "json"
         try:
             resp = _HTTP2.post(
                 f"{ollama_url.rstrip('/')}/api/generate",
-                json=block_payload,
+                json=short_payload,
                 timeout=(float(connect_timeout_s), float(read_timeout_s)),
             )
             resp.raise_for_status()
@@ -635,33 +752,60 @@ def call_ollama_json(
             else:
                 s = resp.text or ""
             s = _trim_code_fences2(s)
+
             if not s:
-                return {
+                out = {
                     "score": None, "subscores": {}, "critical_errors": [], "recommendations": [], "citations": [],
                     "disclaimer": "LLM вернул пустой ответ (blocking fallback)."
                 }
-            return safe_json_extract2(s)
-        except _requests.exceptions.ReadTimeout as e:
+                if raw_stream_text:
+                    out["raw_stream"] = raw_stream_text
+                return out
+
+            parsed2 = safe_json_extract2(s)
+            if isinstance(parsed2, dict) and parsed2:
+                if raw_stream_text:
+                    parsed2.setdefault("raw_stream", raw_stream_text)
+                return parsed2
+
+            # даже блокирующий ответ не JSON → вернём как raw_block + raw_stream
             return {
-                "score": None, "subscores": {}, "critical_errors": [], "recommendations": [], "citations": [],
+                "critical_errors": [],
+                "recommendations": [],
+                "citations": [],
+                "disclaimer": "LLM вернул не-JSON (blocking fallback).",
+                "raw_block": s,
+                **({"raw_stream": raw_stream_text} if raw_stream_text else {}),
+            }
+
+        except _requests.exceptions.ReadTimeout as e:
+            out = {
+                "critical_errors": [], "recommendations": [], "citations": [],
                 "disclaimer": f"LLM timeout: {e} (blocking fallback)"
             }
+            if raw_stream_text:
+                out["raw_stream"] = raw_stream_text
+            return out
         except Exception as e:
-            return {
-                "score": None, "subscores": {}, "critical_errors": [], "recommendations": [], "citations": [],
+            out = {
+                "critical_errors": [], "recommendations": [], "citations": [],
                 "disclaimer": f"Ошибка LLM ({type(e).__name__}): {e}"
             }
+            if raw_stream_text:
+                out["raw_stream"] = raw_stream_text
+            return out
 
     except _requests.exceptions.ConnectTimeout:
         return {
-            "score": None, "subscores": {}, "critical_errors": [], "recommendations": [], "citations": [],
+            "critical_errors": [], "recommendations": [], "citations": [],
             "disclaimer": f"LLM timeout: соединение >{connect_timeout_s} c."
         }
     except Exception as e:
         return {
-            "score": None, "subscores": {}, "critical_errors": [], "recommendations": [], "citations": [],
+            "critical_errors": [], "recommendations": [], "citations": [],
             "disclaimer": f"Ошибка LLM ({type(e).__name__}): {e}"
         }
+
 
 # ================================
 # API models
@@ -786,282 +930,76 @@ def _compact_case_text(txt: str, target_chars: int = 1400) -> str:
             t = cut
 
     return t.strip()
+# ---- helpers: safe formatting for prompt templates ----
+class _SafeDict(dict):
+    def __missing__(self, key):
+        # оставляем неизвестные плейсхолдеры как есть
+        return "{" + key + "}"
 
-@app.post("/analyze")
-def analyze_ep(req: AnalyzeReq):
+def safe_format(template: str, **kwargs) -> str:
     """
-    Эндпоинт анализа кейса.
-    Важное: модель берём из req.model если валидна, иначе — из settings.LLM_ACTIVE.
-    Для DeepSeek-R1 вырезаем <think>...</think> перед нормализацией ответа.
+    Форматирует строку, не падая на чужих {скобках}.
+    Оставляет только {case_text} и {ctx} как настоящие плейсхолдеры,
+    остальные фигурные скобки экранируются.
     """
+    if not isinstance(template, str):
+        return template
+    # временно прячем допустимые плейсхолдеры
+    t = template.replace("{case_text}", "<<<__CASE__>>>").replace("{ctx}", "<<<__CTX__>>>")
+    # экранируем все остальные фигурные скобки
+    t = t.replace("{", "{{").replace("}", "}}")
+    # возвращаем допустимые плейсхолдеры
+    t = t.replace("<<<__CASE__>>>", "{case_text}").replace("<<<__CTX__>>>", "{ctx}")
+    # форматируем безопасно
     try:
-        print("🚀 /analyze")
-        import os, json, time, re
-        t0 = time.perf_counter()
-        t_r0 = t_r1 = t_l0 = t_l1 = t0
+        return t.format_map(_SafeDict(**kwargs))
+    except Exception:
+        # на крайний случай – подставим только известные поля
+        return t.format(case_text=kwargs.get("case_text", ""), ctx=kwargs.get("ctx", ""))
 
-        THINK_TAG_RE = re.compile(r"<think>.*?</think>", flags=re.DOTALL | re.IGNORECASE)
+CODE_BLOCK_RE = re.compile(r"```[a-zA-Z0-9_+\-]*\s*([\s\S]*?)```", flags=re.DOTALL)
 
-        def strip_think(s: str) -> str:
-            try:
-                return THINK_TAG_RE.sub("", s or "").strip()
-            except Exception:
-                return s
+def strip_code_fences_strict(s: str) -> str:
+    """Удаляет полноценный ```блок``` если он целиком. Иначе возвращает как есть."""
+    if not s: return s
+    m = CODE_BLOCK_RE.search(s)
+    return m.group(1).strip() if m else s.strip()
 
-        def sanitize_llm_resp(x):
-            if isinstance(x, str):
-                return strip_think(x)
-            if isinstance(x, dict):
-                y = dict(x)
-                for key in ("response", "message", "text", "raw", "content"):
-                    if key in y and isinstance(y[key], str):
-                        y[key] = strip_think(y[key])
-                return y
-            return x
-
-        def resolve_model(req_model: str | None) -> str:
-            allowed = getattr(settings, "LLM_ALLOWED", []) or []
-            active  = getattr(settings, "LLM_ACTIVE", None)
-            m = (req_model or "").strip() if isinstance(req_model, str) else ""
-            if m and m in allowed:
-                return m
-            if active and active in allowed:
-                return active
-            return allowed[0] if allowed else (m or active or "llama3.1:8b")
-
-        def preset_for(model_id: str) -> dict:
-            presets = getattr(settings, "LLM_PRESETS", {}) or {}
-            return dict(presets.get(model_id, {}))
-
-        if looks_meaningless(req.case_text):
-            return {"result": {
-                "score": 0, "subscores": {}, "critical_errors": [],
-                "recommendations": [], "citations": [],
-                "disclaimer": "Текст кейса не содержит осмысленных данных.",
-            }}
-
-        def _smart_query(case_text: str) -> str:
-            m = re.search(r"\b([A-Za-z]\d{1,2}(?:\.\d+)?)\b", case_text)
-            if m:
-                return m.group(1)
-            t = re.sub(r"\s+", " ", (case_text or "")).strip()
-            return t[:200]
-
-        diag_query = (getattr(req, "query", "") or "").strip()
-        user_input_text = (getattr(req, "case_text", "") or "").strip()
-        k = req.k if isinstance(req.k, int) and 0 <= req.k <= 20 else settings.RETR_TOP_K
-
-        if diag_query:
-            search_q = f"{diag_query}\n{user_input_text[:10000]}".strip() if user_input_text else diag_query
+def strip_code_fences_loose(s: str) -> str:
+    """Удаляет даже НЕЗАКРЫТЫЕ начала кода: '```json\\n...' → текст без первой строки."""
+    if not s: return s
+    s = s.replace("\r", "")
+    s = s.lstrip()
+    if s.startswith("```"):
+        p = s.find("\n")
+        if p != -1:
+            s = s[p+1:]
         else:
-            base = _smart_query(user_input_text)
-            search_q = f"{base}\n{user_input_text[:10000]}".strip() if user_input_text else base
+            s = ""  # весь текст был одной строкой с ``` — убираем
+    # убираем хвостовые «случайные» ```
+    s = s.rstrip("`").rstrip()
+    return s
 
-        print("🔍 query =", search_q)
+def smart_trim(s: str, max_len: int = 1800) -> str:
+    """Аккуратно обрезает по концу предложения/строки/слова, чтобы не резать посреди слова."""
+    if not s or len(s) <= max_len:
+        return (s or "").strip()
+    cut = s[:max_len]
+    # 1) попробуем найти конец предложения в последних 200 символах
+    tail = cut[-200:]
+    off = max(tail.rfind(". "), tail.rfind("! "), tail.rfind("? "), tail.rfind("… "))
+    if off != -1:
+        return (cut[:max_len-200 + off + 2]).rstrip()
+    # 2) иначе конец строки
+    nl = cut.rfind("\n")
+    if nl >= max_len - 200:
+        return cut[:nl].rstrip()
+    # 3) иначе последний пробел
+    sp = cut.rfind(" ")
+    if sp >= max_len - 120:
+        return cut[:sp].rstrip()
+    return cut.rstrip()
 
-        t_r0 = time.perf_counter()
-        ctx_items = retrieve_hybrid(
-            search_q, k,
-            bm25_index_dir=settings.BM25_INDEX_DIR,
-            qdrant_url=settings.QDRANT_URL,
-            qdrant_collection=settings.QDRANT_COLLECTION,
-            pages_dir=settings.PAGES_DIR,
-            hf_model=settings.HF_MODEL,
-            hf_device=settings.HF_DEVICE,
-            hf_fp16=settings.HF_FP16,
-            per_doc_limit=settings.RETR_PER_DOC_LIMIT,
-            reranker_enabled=settings.RERANKER_ENABLED,
-            rerank_top_k=settings.RERANK_TOP_K,
-        )
-        t_r1 = time.perf_counter()
-
-        if not ctx_items:
-            return {"result": {
-                "score": 0, "subscores": {}, "critical_errors": [],
-                "recommendations": [], "citations": [],
-                "disclaimer": "Контекст не найден в базе знаний — невозможно оценить кейс.",
-            }}
-
-        ctx = build_ctx_string(
-            ctx_items,
-            max_chars=min(6000, settings.LLM_NUM_CTX * 3),
-            per_text_limit=settings.CTX_SNIPPET_LIMIT
-        )
-        print(f"📏 lengths: case={len(req.case_text)} ctx={len(ctx)} k={k}")
-
-        DEFAULT_SYSTEM = (
-            "Ты — медицинский ассистент. ОТВЕЧАЙ ТОЛЬКО НА РУССКОМ ЯЗЫКЕ. "
-            "Анализируй текст как врачебный кейс и верни СТРОГО ВАЛИДНЫЙ JSON согласно схеме."
-        )
-        DEFAULT_USER_TPL = (
-            "[КЕЙС]\n{case_text}\n\n[КОНТЕКСТ]\n{ctx}\n\n"
-            "Верни ТОЛЬКО один валидный JSON по указанной схеме."
-        )
-        system = cfg("prompt", "system", default=DEFAULT_SYSTEM) or DEFAULT_SYSTEM
-        user_t = cfg("prompt", "user_template", default=DEFAULT_USER_TPL) or DEFAULT_USER_TPL
-        user = user_t.format(case_text=req.case_text, ctx=ctx)
-
-        model_id = resolve_model(getattr(req, "model", None))
-        pr = preset_for(model_id)
-
-        num_ctx_cap  = int(pr.get("num_ctx",      getattr(settings, "LLM_NUM_CTX", 4096)))
-        max_tokens   = int(pr.get("max_tokens",   getattr(settings, "LLM_MAX_TOKENS", 600)))
-        timeout_s    = int(pr.get("timeout_s",    getattr(settings, "LLM_TIMEOUT", 150)))
-        temperature  = float(pr.get("temperature", 0.2))
-        top_p        = float(pr.get("top_p", 0.95))
-        repeat_pen   = float(pr.get("repeat_penalty", 1.05))
-        gpu_layers   = int(pr.get("gpu_layers",   getattr(settings, "LLM_NUM_GPU_LAYERS", -1) or -1))
-        keep_alive   = str(pr.get("keep_alive",   getattr(settings, "LLM_KEEP_ALIVE", "30m")))
-
-        total_est = _approx_tokens(system) + _approx_tokens(user)
-        min_ctx_env = int(os.getenv("LLM_MIN_CTX", str(getattr(settings, "LLM_MIN_CTX", 4096))))
-        ctx_margin  = int(os.getenv("LLM_CTX_MARGIN", str(getattr(settings, "LLM_CTX_MARGIN", 768))))
-        MIN_CTX     = min(num_ctx_cap, max(1024, min_ctx_env))
-        num_ctx     = max(MIN_CTX, min(num_ctx_cap, total_est + ctx_margin))
-
-        # ключевой момент: таймаут «тишины» между чанками берём из runtime_settings
-        stream_chunk_timeout_s = float(getattr(settings, "LLM_STREAM_CHUNK_TIMEOUT", getattr(settings, "LLM_TIMEOUT", 150)))
-
-        ollama_url = (getattr(req, "ollama_url", None) or settings.LLM_BASE_URL or "").rstrip("/")
-        print(
-            f"🤖 LLM url={ollama_url or 'N/A'} "
-            f"model={model_id} used_ctx={num_ctx} cap_ctx={num_ctx_cap} "
-            f"min_ctx={MIN_CTX} max_tokens={max_tokens} timeout={timeout_s}s"
-        )
-        _sanitized = {
-            "model": model_id,
-            "options": {
-                "num_ctx": num_ctx,
-                "num_predict": max_tokens,
-                "temperature": temperature,
-                "top_p": top_p,
-                "repeat_penalty": repeat_pen,
-                "num_gpu_layers": gpu_layers,
-            },
-            "keep_alive": keep_alive,
-            "stream_chunk_timeout_s": stream_chunk_timeout_s,
-        }
-        print("LLM PAYLOAD (sanitized):", json.dumps(_sanitized, ensure_ascii=False))
-
-        # ---- LLM вызов ----
-        t_l0 = time.perf_counter()
-        resp = call_ollama_json(
-            ollama_url, model_id, system, user,
-            read_timeout_s=float(timeout_s),
-            num_ctx=int(num_ctx),
-            num_predict=int(max_tokens),
-            temperature=float(temperature),
-            options={
-                "top_p": float(top_p),
-                "repeat_penalty": float(repeat_pen),
-                "num_gpu_layers": int(gpu_layers),
-            },
-            keep_alive=keep_alive,
-            stream_chunk_timeout_s=float(getattr(settings, "LLM_STREAM_CHUNK_TIMEOUT", 30)),
-        )
-        resp = sanitize_llm_resp(resp)
-        data = normalize_result(resp)
-        t_l1 = time.perf_counter()
-
-        # --- решаем, делать ли fast-retry ---
-        fast_retry_enabled = bool(getattr(settings, "FAST_RETRY_ENABLED", True))
-        fast_retry_on_empty = bool(getattr(settings, "FAST_RETRY_ON_EMPTY", False))  # по умолчанию False
-        timed_out = isinstance(resp, dict) and isinstance(resp.get("disclaimer"), str) and "timeout" in resp["disclaimer"]
-
-        def _is_empty(d):
-            return (
-                (d.get("score") in (None, 0)) and
-                not d.get("subscores") and
-                not d.get("critical_errors") and
-                not d.get("recommendations")
-            )
-
-        need_retry = fast_retry_enabled and (timed_out or (fast_retry_on_empty and _is_empty(data)))
-
-        if need_retry:
-            print("⏩ fast-retry: shrinking context and num_predict")
-
-            shrink_ratio = float(getattr(settings, "FAST_RETRY_CTX_SHRINK_RATIO", 0.65))
-            ctx_small = build_ctx_string(
-                ctx_items[:max(1, int(len(ctx_items) * shrink_ratio))],
-                max_chars=int(6000 * shrink_ratio),
-                per_text_limit=int(settings.CTX_SNIPPET_LIMIT * shrink_ratio)
-            )
-            user_small = user_t.format(case_text=req.case_text, ctx=ctx_small)
-
-            total_est_small = _approx_tokens(system) + _approx_tokens(user_small)
-            num_ctx_small = min(num_ctx_cap, max(1024, total_est_small + 128))
-
-            # берём либо явный лимит для ретрая, либо тот же max_tokens
-            retry_tokens_cfg = int(getattr(settings, "FAST_RETRY_MAX_TOKENS", 0) or 0)
-            retry_tokens = int(retry_tokens_cfg if retry_tokens_cfg > 0 else max_tokens)
-
-            retry_opts = {
-                "top_p": float(top_p),
-                "repeat_penalty": float(repeat_pen),
-                "num_gpu_layers": int(gpu_layers),
-            }
-
-            t_l0 = time.perf_counter()
-            resp2 = call_ollama_json(
-                ollama_url, model_id, system, user_small,
-                read_timeout_s=float(timeout_s),
-                num_ctx=int(num_ctx_small),
-                num_predict=int(retry_tokens),
-                temperature=max(0.0, float(temperature) * 0.9),
-                options=retry_opts,
-                keep_alive=keep_alive,
-                stream_chunk_timeout_s=float(getattr(settings, "LLM_STREAM_CHUNK_TIMEOUT", 30)),
-            )
-            resp2 = sanitize_llm_resp(resp2)
-
-            data2 = normalize_result(resp2)
-            if not _is_empty(data2):
-                data = data2
-            t_l1 = time.perf_counter()
-
-            if "disclaimer" in data and isinstance(data["disclaimer"], str):
-                if "timeout" in data["disclaimer"]:
-                    data["disclaimer"] += " (выполнен fast-retry, сократили контекст/ответ)"
-                else:
-                    data["disclaimer"] = (data["disclaimer"] + " ") if data["disclaimer"] else ""
-                    data["disclaimer"] += "Выполнен fast-retry: контекст и длина ответа уменьшены."
-
-
-        # ---- пост-обработка ----
-        ctx_len = sum(len(it.get("text", "")) for it in ctx_items)
-        if ctx_len < 500:
-            data["score"] = max(0, (data.get("score") or 0) * 0.5)
-            data["disclaimer"] = (data.get("disclaimer") or "") + " (Недостаточно контекста из базы знаний — достоверность снижена.)"
-        elif ctx_len < 1500:
-            data["score"] = max(0, (data.get("score") or 0) * 0.8)
-            data["disclaimer"] = (data.get("disclaimer") or "") + " (Контекст ограничен — достоверность частично снижена.)"
-
-        data["citations"] = build_context_citations(ctx_items, max_out=5) or [
-            f"{it['doc_id']} стр.{it['page_start']}-{it['page_end']}" for it in ctx_items[:5]
-        ]
-
-        crit_count = len(data.get("critical_errors", []))
-        if crit_count > 0:
-            data["score"] = max(0, (data.get("score") or 0) - 10 * crit_count)
-            data["disclaimer"] = (data.get("disclaimer") or "") + f" (Обнаружено {crit_count} критических ошибок.)"
-
-        t2 = time.perf_counter()
-        def _ms(a, b): return int((b - a) * 1000) if a is not None and b is not None else 0
-        print(f"⏱️ perf: retrieval={_ms(t_r0, t_r1)}ms, llm={_ms(t_l0, t_l1)}ms, total={_ms(t0, t2)}ms")
-
-        return {"result": data, "citations_used": [x["doc_id"] for x in ctx_items]}
-
-    except Exception as e:
-        import traceback
-        print("❌ Ошибка analyze_ep:\n", traceback.format_exc())
-        return {
-            "result": {
-                "score": None, "subscores": {}, "critical_errors": [],
-                "recommendations": [], "citations": [],
-                "disclaimer": f"Ошибка API: {e}",
-            }
-        }
 
 
 # ================================
@@ -1090,12 +1028,18 @@ textarea{min-height:180px}
 .help{font-size:12px;color:#667085;margin-top:4px}
 .muted{color:#667085}
 li{margin:6px 0}
+.chk{display:flex;align-items:center;gap:8px;margin-top:6px}
 </style>
 
 <div class="wrap">
   <div class="card">
-    <h1>AI-ассистент врача (MVP) <span id="score" class="badge">оценка: —</span></h1>
+    <h1>
+      AI-ассистент врача (MVP)
+      <span id="score" class="badge">оценка: —</span>
+      <span id="mode" class="badge" style="background:#eef2ff">режим: мед</span>
+    </h1>
     <div class="small">API: <span id="api"></span></div>
+    <div class="small" id="role" style="margin-top:4px"></div>
   </div>
 
   <div class="card">
@@ -1104,11 +1048,18 @@ li{margin:6px 0}
 
     <div class="row">
       <div>
-        <label>Запрос для поиска (необязательно)</label>
-        <input id="query" placeholder="например: гипертоническая болезнь лечение эналаприл">
+        <label class="chk" title="Если включено — ответит свободная модель без поиска по базе (цитат не будет).">
+          <input type="checkbox" id="use_free">
+          <span class="small">Свободная модель</span>
+        </label>
+
+        <label>Запрос для поиска (опционально, только для режима «мед»)</label>
+        <input id="query" placeholder="например: ИБС лечение...">
+        <div class="help">В режиме «свободная модель» поиск по базе не выполняется.</div>
       </div>
+
       <div>
-        <label>Модель / K</label>
+        <label>Модель / K (только для «мед»)</label>
         <div class="row" style="grid-template-columns:2fr 1fr;gap:8px">
           <select id="model"></select>
           <input id="k" type="number" value="" min="0" max="20" placeholder="по умолч.">
@@ -1118,7 +1069,7 @@ li{margin:6px 0}
     </div>
 
     <div style="margin-top:10px;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-      <button id="run" class="btn">Проанализировать</button>
+      <button id="run" class="btn">Отправить</button>
       <button id="reindex" class="btn" style="background:#059669">🔄 Обновить базу</button>
       <span id="busy" class="small" style="display:none">⏳ выполняется…</span>
       <span id="error" class="small err"></span>
@@ -1129,17 +1080,20 @@ li{margin:6px 0}
     <h3>Результат</h3>
     <div class="grid2" id="subs"></div>
 
-    <div>
+    <div id="crit_wrap">
       <h4>Критические ошибки</h4>
       <ul id="crit"></ul>
     </div>
 
-    <div>
+    <div id="recs_wrap">
       <h4>Рекомендации</h4>
       <ul id="recs"></ul>
     </div>
 
-    <div>
+    <h4>Свободный ответ</h4>
+    <div id="free" style="white-space:pre-wrap;border:1px dashed #e5e7eb;border-radius:10px;padding:10px;background:#fafafa;display:none"></div>
+
+    <div id="cits_wrap">
       <h4>Источники (цитаты)</h4>
       <ul id="cits"></ul>
     </div>
@@ -1154,7 +1108,7 @@ li{margin:6px 0}
 </div>
 
 <script>
-const API = window.location.origin; // если фронт обслуживается тем же FastAPI
+const API = window.location.origin;
 document.getElementById('api').textContent = API;
 
 const el = id => document.getElementById(id);
@@ -1162,9 +1116,9 @@ const show = (n,on) => n.style.display = on ? '' : 'none';
 
 function colorForScore(s){
   if (typeof s !== 'number') return '';
-  if (s >= 85) return '#dcfce7';   // зелёный фон
-  if (s >= 65) return '#fef9c3';   // жёлтый фон
-  return '#fee2e2';                // красный фон
+  if (s >= 85) return '#dcfce7';
+  if (s >= 65) return '#fef9c3';
+  return '#fee2e2';
 }
 
 const labelMap = {
@@ -1196,46 +1150,103 @@ function renderList(ul, items, renderItem, emptyText="Нет"){
   });
 }
 
-function renderResult(r){
-  // Итоговый балл
-  const sc = r.score ?? '—';
-  const sb = el('score');
-  sb.textContent = 'оценка: ' + sc;
-  sb.style.background = colorForScore(typeof sc === 'number' ? sc : NaN);
+function normalizeRecs(R){
+  const arr = Array.isArray(R) ? R : (
+    typeof R === 'string' && R.trim() ? [R.trim()] :
+    (R && typeof R === 'object') ? [R] : []
+  );
+  return arr.filter(x => {
+    if (typeof x === 'string') return x.trim().length > 0;
+    if (x && typeof x === 'object') {
+      const wt = (x.what_to_change || '').trim();
+      const rn = (x.rationale || '').trim();
+      return wt.length > 0 || rn.length > 0;
+    }
+    return !!x;
+  });
+}
 
-  // Subscores
-  const subs = el('subs'); subs.innerHTML = '';
-  const sbs = r.subscores || {};
-  if (Object.keys(sbs).length === 0){
-    const d=document.createElement('div'); d.className='muted'; d.textContent='Подсчёты отсутствуют';
-    subs.appendChild(d);
+function renderResult(r){
+  const metaMode = (r.meta && r.meta.mode) ? String(r.meta.mode) : null;
+  const modeBadge = el('mode');
+  const isFree = metaMode === 'free';
+
+  // бейдж режима
+  modeBadge.textContent = 'режим: ' + (isFree ? 'свободная модель' : 'мед');
+  modeBadge.style.background = isFree ? '#e0f2fe' : '#eef2ff';
+
+  // бейдж оценки (в free не красим)
+  const scBadge = el('score');
+  const sc = (typeof r.score === 'number') ? r.score : '—';
+  scBadge.textContent = 'оценка: ' + sc;
+  scBadge.style.background = isFree ? '' : colorForScore(r.score);
+
+  // роль
+  el('role').textContent = (r.meta && r.meta.role) ? ('Роль: ' + String(r.meta.role)) : '';
+
+  // свободный ответ:
+  //  - в FREE показываем ТОЛЬКО free_text
+  //  - в MED показываем free_text, если он есть (иначе прячем)
+  const freeBox = el('free');
+  const freeTxt = (r.free_text || '').toString().trim();
+  if (isFree) {
+    if (freeTxt) { freeBox.textContent = freeTxt; show(freeBox, true); }
+    else { freeBox.textContent = ''; show(freeBox, false); }
   } else {
-    Object.entries(sbs).forEach(([k,v])=>{
+    if (freeTxt) { freeBox.textContent = freeTxt; show(freeBox, true); }
+    else { freeBox.textContent = ''; show(freeBox, false); }
+  }
+
+  // сабскоринг
+  const subs = el('subs');
+  subs.innerHTML = '';
+  const entries = Object.entries(r.subscores || {});
+  if (entries.length === 0) subs.style.display = 'none';
+  else {
+    subs.style.display = 'grid';
+    entries.forEach(([k,v])=>{
       const d=document.createElement('div'); d.className='card'; d.style.margin=0;
-      d.innerHTML=`<div class="small">${labelMap[k] || k}</div><div style="font-weight:700">${(v ?? '—')}</div>`;
+      d.innerHTML=`<div class="small">${labelMap[k] || k}</div><div style="font-weight:700">${v??'—'}</div>`;
       subs.appendChild(d);
     });
   }
 
-  // Критические ошибки
+  // критические ошибки
   renderList(el('crit'), r.critical_errors, (li,x)=>{
     const typ = (x && x.type) ? String(x.type) : 'Ошибка';
     const exp = (x && x.explain) ? String(x.explain) : '';
     li.textContent = exp ? (typ + ': ' + exp) : typ;
   });
 
-  // Рекомендации
-  renderList(el('recs'), r.recommendations, (li,x)=>{
-    const what = (x && x.what_to_change) ? String(x.what_to_change) : '—';
-    const why  = (x && x.rationale) ? String(x.rationale) : '';
-    li.textContent = why ? (what + ' — ' + why) : what;
+  // рекомендации
+  renderList(el('recs'), normalizeRecs(r.recommendations), (li,x)=>{
+    if (typeof x === 'string') li.textContent = x;
+    else if (x && typeof x === 'object') {
+      const wt = (x.what_to_change || '').trim();
+      const rn = (x.rationale || '').trim();
+      li.textContent = wt && rn ? `${wt} — ${rn}` : (wt || rn || JSON.stringify(x));
+    } else li.textContent = String(x);
   });
 
-  // Цитаты
-  renderList(el('cits'), r.citations, (li,x)=>{ li.textContent = String(x); });
+  // цитаты: в FREE полностью скрываем; в MED — по наличию
+  const citsWrap = el('cits_wrap');
+  const cits = el('cits');
+  if (isFree) {
+    citsWrap.style.display = 'none';
+    cits.innerHTML = '';
+  } else {
+    const hasCits = Array.isArray(r.citations) && r.citations.length > 0;
+    if (hasCits) {
+      citsWrap.style.display = '';
+      renderList(cits, r.citations, (li,x)=>{ li.textContent = String(x); });
+    } else {
+      citsWrap.style.display = 'none';
+      cits.innerHTML = '';
+    }
+  }
 
-  // Дисклеймер
-  el('disc').textContent = r.disclaimer ? String(r.disclaimer) : '';
+  // дисклеймер — не показываем в FREE
+  el('disc').textContent = isFree ? '' : (r.disclaimer ? String(r.disclaimer) : '');
   el('raw').textContent = JSON.stringify(r,null,2);
 }
 
@@ -1244,6 +1255,17 @@ function prettyModelName(id){
   if (id === 'llama3.1:70b')     return 'Llama 3.1 (70B)';
   if (id === 'deepseek-r1:32b')  return 'DeepSeek R1 (32B)';
   return id;
+}
+
+function updateModeUI(){
+  const isFree = el('use_free').checked;
+  el('query').disabled = isFree;
+  el('model').disabled = isFree;
+  el('k').disabled = isFree;
+
+  const modeBadge = el('mode');
+  modeBadge.textContent = 'режим: ' + (isFree ? 'свободная модель' : 'мед');
+  modeBadge.style.background = isFree ? '#e0f2fe' : '#eef2ff';
 }
 
 async function fillModels(){
@@ -1267,6 +1289,8 @@ async function fillModels(){
       opt.value = id; opt.textContent = prettyModelName(id);
       sel.appendChild(opt);
     });
+  } finally {
+    updateModeUI();
   }
 }
 
@@ -1280,7 +1304,8 @@ async function run(){
     const body = {
       case_text: (el('case').value || '').trim(),
       query:     (el('query').value || '').trim() || null,
-      model:     el('model').value || 'llama3.1:8b'
+      model:     el('model').value || 'llama3.1:8b',
+      use_free:  !!el('use_free').checked
     };
 
     const kRaw = (el('k').value || '').trim();
@@ -1310,6 +1335,7 @@ async function run(){
   }
 }
 
+el('use_free').addEventListener('change', updateModeUI);
 el('run').onclick = run;
 
 el('reindex').onclick = async () => {
@@ -1345,12 +1371,11 @@ async function checkReindexStatus() {
   } catch(e) { console.error(e); }
 }
 
-// Реже опрашиваем статус (уменьшает шум логов в бэкенде)
-setInterval(checkReindexStatus, 60000); // было 20000
-
+setInterval(checkReindexStatus, 60000);
 fillModels();
 </script>
 """
+
 
 
 @app.get("/", response_class=HTMLResponse)

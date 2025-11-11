@@ -42,6 +42,24 @@ def _normalize_qdrant_url(url_in: Optional[str]) -> str:
 # ================== ГЛАВНЫЙ БЛОК УПРАВЛЕНИЯ ==================
 # Меняешь здесь — эти значения перекроют .env / docker env
 CONTROL: Dict[str, Any] = {
+    "PROMPT_SYSTEM": (
+        "Ты — медицинский ассистент. ОТВЕЧАЙ ТОЛЬКО НА РУССКОМ ЯЗЫКЕ. "
+        "Анализируй текст как врачебный кейс (жалобы, анамнез, осмотр, диагноз и назначения) и сопоставляй с КОНТЕКСТОМ. "
+        "Верни КОМПАКТНЫЙ JSON со СЛЕДУЮЩИМИ полями:\n"
+        "{critical_errors[], recommendations, meta}\n"
+        "- critical_errors: СТРОГО список объектов {type, explain} (если нет — пустой список).\n"
+        "- recommendations: СВОБОДНЫЙ ответ — либо одна строка, либо список строк. "
+        "Здесь можно давать советы, пояснения и отвечать на сторонние вопросы (например, 'кто ты').\n"
+        "- meta: объект с метаданными; обязательно укажи meta.role='медицинский ассистент'.\n"
+        "НИКАКОГО Markdown, только JSON. Внешние источники не используй."
+    ),
+    "PROMPT_USER_TPL": (
+        "[КЕЙС]\n{case_text}\n\n"
+        "[КОНТЕКСТ]\n{ctx}\n\n"
+        "Верни ТОЛЬКО один валидный JSON по указанной схеме. "
+        "Внутри recommendations — свободный текст/список строк. "
+        "critical_errors — только список объектов {type, explain}."
+    ),
     # --- LLM выбор модели ---
     "LLM_ACTIVE": "deepseek-r1:32b",  # активная по умолчанию
     "LLM_ALLOWED": ["llama3.1:8b", "llama3.1:70b", "deepseek-r1:32b"],
@@ -63,18 +81,41 @@ CONTROL: Dict[str, Any] = {
             "gpu_layers": -1, "keep_alive": "30m"
         },
         "deepseek-r1:32b": {
-            "num_ctx": 12288, "max_tokens": 800, "timeout_s": 180,
+            "num_ctx": 12288, "max_tokens": 1800, "timeout_s": 180,
             "temperature": 0.3, "top_p": 0.90, "repeat_penalty": 1.05,
             "gpu_layers": -1, "keep_alive": "60m"
         },
     },
 
+    #Free-mode
+    "MED_GUARD_MODE" : "soft",
+    "FREECHAT_ENABLED": True,
+    "FREECHAT_MODEL" : "deepseek-r1:32b",
+    "FREECHAT_NUM_CTX" : 8192,
+    "FREECHAT_MAX_TOKENS" : 800,
+    "FREECHAT_TEMPERATURE" : 0.9,
+    "FREECHAT_TOP_P" : 0.95,
+    "FREECHAT_REPEAT_PENALTY" : 1.0,
+    "FREECHAT_NUM_GPU_LAYERS" : -1,
+    "FREECHAT_KEEP_ALIVE" : "60m",
+    "FREECHAT_STREAM_CHUNK_TIMEOUT" : 60.0,
+    "FREE_PROMPT_SYSTEM" : "Ты дружелюбный помощник. Отвечай кратко, только на русском, без Markdown и код-блоков.",
+    "FREE_PROMPT_USER_TPL" : "{case_text}",
+
+
+
+
         # Fast-retry управления
     "FAST_RETRY_ENABLED": True,          # включён, но
     "FAST_RETRY_ON_EMPTY": False,        # НЕ ретраим, если просто пусто/невалидный JSON; только при реальном timeout
     "FAST_RETRY_CTX_SHRINK_RATIO": 0.65, # во сколько раз ужимать контекст при ретрае
-    "FAST_RETRY_MAX_TOKENS": 120,        # максимум токенов при ретрае (можно 0 чтобы брать исходные)
+    "FAST_RETRY_MAX_TOKENS": 300,        # максимум токенов при ретрае (можно 0 чтобы брать исходные)
     "LLM_ENFORCE_JSON_STREAM": True, # принудительно просим модель давать JSON (format=json) даже в stream
+    # режим свободного чата
+    "FREE_CHAT_ENABLED": True,
+    "FREE_CHAT_MAX_LEN": 64,  # до скольки символов считаем "короткой болталкой"
+    "FREE_CHAT_TRIGGERS": ["кто ты", "кто-ты", "скажи кто ты", "ты кто", "кто такой"],
+
 
 
     # Глобальные LLM-параметры (дефолты, если где-то понадобятся)
@@ -186,6 +227,8 @@ class Settings:
     LLM_ALLOWED: list = _env_json_or_default("LLM_ALLOWED", CONTROL["LLM_ALLOWED"])
     LLM_LABELS: dict = _env_json_or_default("LLM_LABELS", CONTROL.get("LLM_LABELS", {}))
     LLM_PRESETS: dict = _env_json_or_default("LLM_PRESETS", CONTROL["LLM_PRESETS"])
+    PROMPT_SYSTEM: str = os.getenv("PROMPT_SYSTEM", CONTROL["PROMPT_SYSTEM"])
+    PROMPT_USER_TPL: str = os.getenv("PROMPT_USER_TPL", CONTROL["PROMPT_USER_TPL"])
 
     LLM_KEEP_ALIVE: str = os.getenv("LLM_KEEP_ALIVE", CONTROL["LLM_KEEP_ALIVE"])
     LLM_STREAM_CHUNK_TIMEOUT: int = _to_int(os.getenv("LLM_STREAM_CHUNK_TIMEOUT"), CONTROL["LLM_STREAM_CHUNK_TIMEOUT"])
@@ -242,6 +285,8 @@ class Settings:
 
         # Базовые переменные окружения для кода, который их ожидает
         os.environ.setdefault("QDRANT_URL", self.QDRANT_URL)
+        os.environ.setdefault("PROMPT_SYSTEM", self.PROMPT_SYSTEM)
+        os.environ.setdefault("PROMPT_USER_TPL", self.PROMPT_USER_TPL)
         os.environ.setdefault("BM25_INDEX_DIR", self.BM25_INDEX_DIR)
         os.environ.setdefault("PAGES_DIR", self.PAGES_DIR)
         os.environ.setdefault("HF_MODEL", self.HF_MODEL)
