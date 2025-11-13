@@ -1,74 +1,60 @@
 services:
   qdrant:
-    image: qdrant/qdrant:latest
+    image: qdrant/qdrant:1.13.4
     container_name: medai_qdrant_prod
     restart: unless-stopped
     ports:
-      - "7778:6333"                       # внешний 7778 → внутренний 6333
+      - "7778:6333"
     volumes:
       - qdrant_storage_prod:/qdrant/storage
     healthcheck:
-      # сначала HTTP, иначе проверяем TCP-порт
       test: ["CMD-SHELL", "(command -v curl >/dev/null && curl -fsS http://localhost:6333/readyz >/dev/null) || (echo > /dev/tcp/localhost/6333)"]
       interval: 10s
       timeout: 5s
       retries: 10
       start_period: 10s
 
+  ollama:
+    image: ollama/ollama:latest
+    container_name: medai_ollama_prod
+    restart: unless-stopped
+    # порт наружу для прода не нужен, app ходит по сети compose
+    gpus: "all"
+    environment:
+      OLLAMA_HOST: "0.0.0.0:11434"
+      OLLAMA_KEEP_ALIVE: "30m"
+    volumes:
+      - ollama_models_prod:/root/.ollama
+    # healthcheck можно опустить; образ не всегда содержит curl/wget
+
   app:
-    # ВАЖНО: прод работает из ПРЕДСОБРАННОГО образа.
-    # Укажи тег образа через .env.prod → APP_IMAGE_TAG=prod-<commit>
     image: med_ai-app:${APP_IMAGE_TAG:-prod}
     container_name: medai_app_prod
     restart: unless-stopped
 
     depends_on:
       qdrant:
-        condition: service_healthy
+        condition: service_started
+      ollama:
+        condition: service_started
 
-    # GPU для PyTorch/FlagEmbedding (нужен NVIDIA Container Toolkit)
     gpus: "all"
     shm_size: "2g"
 
+    # Читаем .env.prod (важно!)
+    env_file:
+      - .env.prod
+
     environment:
-      # --- База знаний ---
-      QDRANT_URL: "http://qdrant:6333"
-      QDRANT_COLLECTION: "med_kb_v3"
-      QDRANT__PREFER_GRPC: "false"
-
-      # --- Эмбеддинги HF (GPU) ---
-      EMB_BACKEND: "hf"
-      HF_MODEL: "BAAI/bge-m3"
-      HF_DEVICE: "cuda"
-      EMB_BATCH: "128"                     # безопасный батч по умолчанию
-
-      # --- Reranker (опционально) ---
-      RERANKER_MODEL: "BAAI/bge-reranker-v2-m3"
-
-      # --- CUDA аллокатор: меньше фрагментации VRAM ---
-      PYTORCH_CUDA_ALLOC_CONF: "max_split_size_mb:128,expandable_segments:True,garbage_collection_threshold:0.7"
-
-      # --- Кэши (персистентно в named volumes) ---
-      HF_HOME: "/root/.cache/huggingface"
-      TRANSFORMERS_CACHE: "/root/.cache/huggingface"
-      HUGGINGFACE_HUB_CACHE: "/root/.cache/huggingface"
-      EASYOCR_DIR: "/root/.EasyOCR"
-      EASYOCR_ALLOW_DOWNLOADS: "1"
-
-      # --- Конфиг приложения ---
+      # Минимум, что задаём явно поверх .env:
       APP_ENV: "prod"
       APP_HOST: "0.0.0.0"
       APP_PORT: "8000"
       WEB_CONCURRENCY: "2"
 
-      # --- LLM (если нужен Ollama на хосте) ---
-      # MODEL_ID: "llama3.1:8b"
-      # LLM_BASE_URL: "http://ollama:11434"
-
     ports:
       - "8050:8000"
 
-    # только данные/индексы/сырые документы и кэши — НИКАКИХ маунтов кода!
     volumes:
       - ./data:/app/data
       - ./index:/app/index
@@ -76,17 +62,9 @@ services:
       - hf_cache:/root/.cache/huggingface
       - easyocr_cache:/root/.EasyOCR
 
-    # корректная резолюция host.docker.internal на Linux
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
-    # health самого API
-    healthcheck:
-      test: ["CMD-SHELL", "curl -fsS http://localhost:8000/health >/dev/null || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 20s
 
     command: ["bash", "start.sh"]
 
@@ -94,3 +72,4 @@ volumes:
   qdrant_storage_prod:
   hf_cache:
   easyocr_cache:
+  ollama_models_prod:

@@ -43,23 +43,24 @@ def _normalize_qdrant_url(url_in: Optional[str]) -> str:
 # Меняешь здесь — эти значения перекроют .env / docker env
 CONTROL: Dict[str, Any] = {
     "PROMPT_SYSTEM": (
-        "Ты — медицинский ассистент. ОТВЕЧАЙ ТОЛЬКО НА РУССКОМ ЯЗЫКЕ. "
-        "Анализируй текст как врачебный кейс (жалобы, анамнез, осмотр, диагноз и назначения) и сопоставляй с КОНТЕКСТОМ. "
-        "Верни КОМПАКТНЫЙ JSON со СЛЕДУЮЩИМИ полями:\n"
-        "{critical_errors[], recommendations, meta}\n"
-        "- critical_errors: СТРОГО список объектов {type, explain} (если нет — пустой список).\n"
-        "- recommendations: СВОБОДНЫЙ ответ — либо одна строка, либо список строк. "
-        "Здесь можно давать советы, пояснения и отвечать на сторонние вопросы (например, 'кто ты').\n"
-        "- meta: объект с метаданными; обязательно укажи meta.role='медицинский ассистент'.\n"
-        "НИКАКОГО Markdown, только JSON. Внешние источники не используй."
+        "Ты — ассистент поиска по медицинской базе. Отвечай ТОЛЬКО по тексту из КОНТЕКСТА (фрагменты базы). "
+        "Никаких собственных знаний и предположений. Если точного ответа в КОНТЕКСТЕ нет — прямо напиши: "
+        "\"Нет ответа в базе по предоставленному контексту.\" "
+        "Отвечай кратко, на русском, без Markdown и без код-блоков."
     ),
     "PROMPT_USER_TPL": (
-        "[КЕЙС]\n{case_text}\n\n"
-        "[КОНТЕКСТ]\n{ctx}\n\n"
-        "Верни ТОЛЬКО один валидный JSON по указанной схеме. "
-        "Внутри recommendations — свободный текст/список строк. "
-        "critical_errors — только список объектов {type, explain}."
+        "ВОПРОС/ЗАПРОС:\n"
+        "{case_text}\n\n"
+        "КОНТЕКСТ (фрагменты из базы):\n"
+        "{ctx}\n\n"
+        "ЗАДАЧА:\n"
+        "- Найди в КОНТЕКСТЕ точный ответ (термин, число, краткую фразу) и выдай его кратко.\n"
+        "- Если в КОНТЕКСТЕ нет однозначного ответа — напиши: \"Нет ответа в базе по предоставленному контексту.\"\n"
+        "- В конце строки перечисли источники в формате: Источники: DOC_ID стр.A-B; DOC_ID стр.C-D\n"
+        "- Краткость важнее. Без Markdown и код-блоков."
     ),
+
+
     # --- LLM выбор модели ---
     "LLM_ACTIVE": "deepseek-r1:32b",  # активная по умолчанию
     "LLM_ALLOWED": ["llama3.1:8b", "llama3.1:70b", "deepseek-r1:32b"],
@@ -87,55 +88,48 @@ CONTROL: Dict[str, Any] = {
         },
     },
 
-    #Free-mode
-    "MED_GUARD_MODE" : "soft",
+    # Free-mode
+    "MED_GUARD_MODE": "soft",
     "FREECHAT_ENABLED": True,
-    "FREECHAT_MODEL" : "deepseek-r1:32b",
-    "FREECHAT_NUM_CTX" : 8192,
-    "FREECHAT_MAX_TOKENS" : 800,
-    "FREECHAT_TEMPERATURE" : 0.9,
-    "FREECHAT_TOP_P" : 0.95,
-    "FREECHAT_REPEAT_PENALTY" : 1.0,
-    "FREECHAT_NUM_GPU_LAYERS" : -1,
-    "FREECHAT_KEEP_ALIVE" : "60m",
-    "FREECHAT_STREAM_CHUNK_TIMEOUT" : 60.0,
-    "FREE_PROMPT_SYSTEM" : "Ты дружелюбный помощник. Отвечай кратко, только на русском, без Markdown и код-блоков.",
-    "FREE_PROMPT_USER_TPL" : "{case_text}",
+    "FREECHAT_MODEL": "deepseek-r1:32b",
+    "FREECHAT_NUM_CTX": 8192,
+    "FREECHAT_MAX_TOKENS": 800,
+    "FREECHAT_TEMPERATURE": 0.9,
+    "FREECHAT_TOP_P": 0.95,
+    "FREECHAT_REPEAT_PENALTY": 1.0,
+    "FREECHAT_NUM_GPU_LAYERS": -1,
+    "FREECHAT_KEEP_ALIVE": "60m",
+    "FREE_PROMPT_SYSTEM": "Ты дружелюбный помощник. Отвечай кратко, только на русском, без Markdown и код-блоков.",
+    "FREE_PROMPT_USER_TPL": "{case_text}",
 
+    # Fast-retry управления
+    "FAST_RETRY_ENABLED": True,
+    "FAST_RETRY_ON_EMPTY": False,
+    "FAST_RETRY_CTX_SHRINK_RATIO": 0.65,
+    "FAST_RETRY_MAX_TOKENS": 300,
 
-
-
-        # Fast-retry управления
-    "FAST_RETRY_ENABLED": True,          # включён, но
-    "FAST_RETRY_ON_EMPTY": False,        # НЕ ретраим, если просто пусто/невалидный JSON; только при реальном timeout
-    "FAST_RETRY_CTX_SHRINK_RATIO": 0.65, # во сколько раз ужимать контекст при ретрае
-    "FAST_RETRY_MAX_TOKENS": 300,        # максимум токенов при ретрае (можно 0 чтобы брать исходные)
-    "LLM_ENFORCE_JSON_STREAM": True, # принудительно просим модель давать JSON (format=json) даже в stream
-    # режим свободного чата
+    # режим свободного чата (триггеры)
     "FREE_CHAT_ENABLED": True,
-    "FREE_CHAT_MAX_LEN": 64,  # до скольки символов считаем "короткой болталкой"
+    "FREE_CHAT_MAX_LEN": 64,
     "FREE_CHAT_TRIGGERS": ["кто ты", "кто-ты", "скажи кто ты", "ты кто", "кто такой"],
-
-
 
     # Глобальные LLM-параметры (дефолты, если где-то понадобятся)
     "LLM_KEEP_ALIVE": "30m",
-    "LLM_STREAM_CHUNK_TIMEOUT": 100,  # таймаут тишины между чанками (сек)
     "LLM_NUM_CTX": 8192,
     "LLM_MAX_TOKENS": 600,
     "LLM_TIMEOUT": 150,
-    "LLM_CTX_MARGIN": 256,     # запас к контексту при расчёте
-    "LLM_MIN_CTX": 2048,       # минимальный допустимый контекст
-    "LLM_NUM_GPU_LAYERS": -1,  # -1 => «все слои на GPU» в Ollama
+    "LLM_CTX_MARGIN": 256,
+    "LLM_MIN_CTX": 2048,
+    "LLM_NUM_GPU_LAYERS": -1,
 
     # Чанкинг (dense и BM25)
-    "CHILD_W": 200,
-    "CHILD_OVERLAP": 40,
-    "PARENT_W": 800,
+    "CHILD_W": 180,
+    "CHILD_OVERLAP": 30,
+    "PARENT_W": 500,
 
     # BM25-специфика
-    "BM25_CHILD_W": 200,
-    "BM25_CHILD_OVERLAP": 40,
+    "BM25_CHILD_W": 180,
+    "BM25_CHILD_OVERLAP": 30,
     "BM25_LANGUAGE": "ru",
 
     # API / App
@@ -147,7 +141,7 @@ CONTROL: Dict[str, Any] = {
     # Retrieval
     "RETR_TOP_K": 8,
     "RETR_PER_DOC_LIMIT": 1,
-    "CTX_SNIPPET_LIMIT": 4000,  # сколько символов контекста отдавать в LLM
+    "CTX_SNIPPET_LIMIT": 4000,
 
     # Paths & indexes
     "PAGES_DIR": "data",
@@ -158,7 +152,7 @@ CONTROL: Dict[str, Any] = {
     # Embeddings
     "EMB_BACKEND": "hf",
     "HF_MODEL": "BAAI/bge-m3",
-    "HF_DEVICE": 'cuda',   # 'cuda' | 'cpu' | None(авто)
+    "HF_DEVICE": 'cuda',
     "HF_FP16": True,
     "EMB_BATCH": 128,
 
@@ -171,7 +165,7 @@ CONTROL: Dict[str, Any] = {
     "EASYOCR_DIR": "/root/.EasyOCR",
     "EASYOCR_ALLOW_DOWNLOADS": True,
 
-    # HF cache (чтобы не писать в '/.cache/...'),
+    # HF cache
     "TRANSFORMERS_CACHE": "/root/.cache/huggingface",
 
     # Logs
@@ -231,7 +225,6 @@ class Settings:
     PROMPT_USER_TPL: str = os.getenv("PROMPT_USER_TPL", CONTROL["PROMPT_USER_TPL"])
 
     LLM_KEEP_ALIVE: str = os.getenv("LLM_KEEP_ALIVE", CONTROL["LLM_KEEP_ALIVE"])
-    LLM_STREAM_CHUNK_TIMEOUT: int = _to_int(os.getenv("LLM_STREAM_CHUNK_TIMEOUT"), CONTROL["LLM_STREAM_CHUNK_TIMEOUT"])
     LLM_NUM_CTX: int = _to_int(os.getenv("LLM_NUM_CTX"), CONTROL["LLM_NUM_CTX"])
     LLM_MAX_TOKENS: int = _to_int(os.getenv("LLM_MAX_TOKENS"), CONTROL["LLM_MAX_TOKENS"])
     LLM_TIMEOUT: int = _to_int(os.getenv("LLM_TIMEOUT"), CONTROL["LLM_TIMEOUT"])
@@ -335,7 +328,7 @@ class Settings:
         print(f"  LLM.active = {llm_get_active()}")
         print(f"  LLM.allowed= {', '.join(llm_get_allowed())}")
         print(f"  LLM.globals= num_ctx={self.LLM_NUM_CTX}, max_tokens={self.LLM_MAX_TOKENS}, timeout={self.LLM_TIMEOUT}s")
-        print(f"  LLM.extra  = min_ctx={self.LLM_MIN_CTX}, ctx_margin={self.LLM_CTX_MARGIN}, keep_alive={self.LLM_KEEP_ALIVE}, gpu_layers={self.LLM_NUM_GPU_LAYERS}, stream_chunk_timeout={self.LLM_STREAM_CHUNK_TIMEOUT}s")
+        print(f"  LLM.extra  = min_ctx={self.LLM_MIN_CTX}, ctx_margin={self.LLM_CTX_MARGIN}, keep_alive={self.LLM_KEEP_ALIVE}, gpu_layers={self.LLM_NUM_GPU_LAYERS}")
         print(f"  QDRANT  = {self.QDRANT_URL} (collection={self.QDRANT_COLLECTION})")
         print(f"  BM25    = {self.BM25_INDEX_DIR} (lang={CONTROL['BM25_LANGUAGE']})")
         print(f"  PAGES   = {self.PAGES_DIR}")

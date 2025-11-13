@@ -7,6 +7,12 @@
   - --emb-backend hf       → локально через FlagEmbedding (GPU, быстро)
   - --emb-backend ollama   → через Ollama /api/embeddings
 
+Ключевые правки:
+  • В payload теперь пишется chunk_text (обрезанный текст чанка) и стабильный chunk_id,
+    чтобы на этапе retrieve_hybrid можно было фьюзить и возвращать лучшие ЧАНКИ, а не документы.
+  • По умолчанию child_w/overlap приведены к более «узким» окнам (180/40), parent_w уменьшён до 500,
+    чтобы повысить точность попаданий. Параметры можно переопределять флагами/ENV.
+
 Примеры:
   # HF / GPU (bge-m3)
   python chunk_and_index.py \
@@ -327,6 +333,9 @@ class HFEmbedder:
         vecs = np.asarray(vecs, dtype=np.float32)
         if vecs.ndim == 1:
             vecs = vecs.reshape(1, -1)
+        # страховочная нормализация
+        norms = np.linalg.norm(vecs, axis=1, keepdims=True) + 1e-9
+        vecs = (vecs / norms).astype(np.float32)
         return vecs
 
     def get_dim(self) -> int:
@@ -378,9 +387,10 @@ def main() -> None:
     ap.add_argument("--qdrant-url", default="http://qdrant:6333")
     ap.add_argument("--collection", default="med_kb_v3")
 
-    ap.add_argument("--child-w", type=int, default=150)
-    ap.add_argument("--child-overlap", type=int, default=30)
-    ap.add_argument("--parent-w", type=int, default=800)
+    # Синхронизированы дефолты (более «узкие» окна)
+    ap.add_argument("--child-w", type=int, default=180)
+    ap.add_argument("--child-overlap", type=int, default=40)
+    ap.add_argument("--parent-w", type=int, default=500)
 
     # batch из ENV EMB_BATCH (деф. 256 если не указан в ENV)
     ap.add_argument("--batch", type=int, default=_env_int("EMB_BATCH", 256))
@@ -497,14 +507,21 @@ def main() -> None:
 
             points: List[PointStruct] = []
             for i, c in enumerate(chunk):
+                # стабильный id точки (uuid5 на основе doc_id и text_hash)
                 unique_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, f"{doc_id}_{c['text_hash']}"))
+                # стабильный идентификатор чанка для фьюжна/дедупа на этапе retrieve
+                chunk_id = f"{doc_id}:{c['parent_id']}:{c['text_hash']}"
+
                 payload = {
                     "doc_id": doc_id,
                     "parent_id": c["parent_id"],
                     "page_start": c["page_range"][0],
                     "page_end": c["page_range"][1],
                     "len_words": len(c["text"].split()),
+                    "child_len_words": len(c["text"].split()),  # алиас для наглядности
                     "text_hash": c["text_hash"],
+                    "chunk_text": c["text"][:800],               # <— точный текст чанка (усечённый)
+                    "chunk_id": chunk_id,                         # <— стабильный chunk-id
                 }
                 points.append(PointStruct(id=unique_id, vector=emb_rows[i], payload=payload))
 

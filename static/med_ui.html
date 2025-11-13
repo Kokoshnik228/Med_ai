@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI-ассистент врача — чат</title>
+  <style>
+    :root { --bg:#f6f7fb; --card:#fff; --border:#e5e7eb; --text:#101828; }
+    * { box-sizing: border-box; }
+    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:var(--bg);margin:0;color:var(--text)}
+    .wrap{max-width:1200px;margin:20px auto;padding:16px}
+    .card{background:var(--card);border:1px solid var(--border);border-radius:16px;box-shadow:0 1px 3px rgba(16,24,40,.08);padding:16px;margin-bottom:16px}
+    h1{font-size:20px;margin:0 0 8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+    .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+    label{font-weight:600;font-size:14px}
+    select,textarea{border:1px solid #d0d5dd;border-radius:10px;padding:10px;font-size:14px}
+    select{min-width:260px}
+    .btn{background:#2563eb;color:#fff;border:none;border-radius:10px;padding:10px 14px;font-weight:600;cursor:pointer}
+    .btn:disabled{opacity:.6;cursor:not-allowed}
+    .muted{color:#667085}
+    .small{font-size:12px;color:#667085}
+    .badge{display:inline-block;border:1px solid #d0d5dd;border-radius:999px;padding:2px 8px;font-size:12px}
+
+    /* layout */
+    .grid{display:grid;grid-template-columns:1fr 320px;gap:16px}
+    @media (max-width: 980px){ .grid{grid-template-columns:1fr} .sidebar{position:static} }
+    .sidebar{position:sticky; top:16px; align-self:start}
+
+    /* chat */
+    #chat {height:62vh;min-height:420px;overflow:auto;padding:8px;border:1px solid var(--border);border-radius:12px;background:#fafbff}
+    .bubble{position:relative;max-width:80%;padding:10px 12px;border-radius:14px;margin:10px 0;white-space:pre-wrap;line-height:1.45}
+    .user{margin-left:auto;background:#e0f2fe}
+    .assistant{margin-right:auto;background:#eef2ff}
+    .role{font-size:12px;font-weight:700;margin-bottom:6px;opacity:.8}
+    .composer{display:grid;grid-template-columns:1fr auto;gap:10px}
+    #msg{width:100%;min-height:60px;max-height:180px;resize:vertical}
+
+    /* think + sources */
+    #think{white-space:pre-wrap;background:#0b1020;color:#e6e6f0;border-radius:10px;padding:10px;max-height:28vh;overflow:auto}
+    #sources{margin:6px 0 0; padding-left: 18px;}
+    #sources li{margin:6px 0}
+  </style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="card">
+    <h1>
+      AI-ассистент врача — чат
+      <span id="status" class="badge">готов</span>
+    </h1>
+    <div class="row">
+      <label for="model">Модель:</label>
+      <select id="model"></select>
+      <label class="row" style="gap:6px;"><input type="checkbox" id="stream" checked /> потоковая выдача</label>
+      <span id="api" class="small"></span>
+    </div>
+  </div>
+
+  <div class="grid">
+    <!-- Левая колонка: чат -->
+    <div>
+      <div class="card">
+        <div id="chat"></div>
+        <div style="height:10px"></div>
+        <div class="composer">
+          <textarea id="msg" placeholder="Введите сообщение…"></textarea>
+          <div class="row" style="gap:10px">
+            <button id="send" class="btn">Отправить</button>
+            <button id="clear" class="btn" style="background:#6b7280">Очистить</button>
+          </div>
+        </div>
+        <div class="small muted" id="err" style="margin-top:8px"></div>
+      </div>
+    </div>
+
+    <!-- Правая колонка: мысли + источники -->
+    <div class="sidebar">
+      <div class="card">
+        <h3 style="margin:0 0 8px">Мысли (черновик)</h3>
+        <div id="think" class="mono small">—</div>
+      </div>
+      <div class="card">
+        <h3 style="margin:0 0 8px">Источники</h3>
+        <ul id="sources" class="small muted"></ul>
+        <div class="card">
+          <h3>Фрагменты (RAG)</h3>
+          <ul id="chunks"></ul>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>window.API_BASE = window.API_BASE || (location.origin.startsWith("http") ? location.origin : "http://srv-ai:7050");</script>
+<script src="/static/api.js?v=chat3"></script>
+</body>
+</html>

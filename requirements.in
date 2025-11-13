@@ -1,42 +1,45 @@
-
-
+# --- API / web ---
 fastapi==0.115.2
 uvicorn[standard]==0.32.0
+aiofiles==24.1.0          # статические файлы/аплоады быстрее и без блокировок
+
+# --- Config / utils ---
 pydantic==2.9.2
+python-dotenv==1.0.1
+pyyaml==6.0.2
+ruamel.yaml==0.18.6
 requests==2.32.3
 tqdm==4.67.1
-pyyaml==6.0.2
-python-dotenv==1.0.1
-ruamel.yaml==0.18.6
+chardet==5.2.0
 
-
+# --- Retrieval: BM25 / Qdrant ---
 qdrant-client==1.12.0
 pyserini==0.41.0
 rank-bm25==0.2.2
 rapidfuzz==3.9.7
 
-
+# --- HuggingFace / embeddings / reranker ---
+# ВАЖНО: torch не указывать здесь — ставим в Dockerfile по каналам CUDA.
+transformers==4.44.2
+huggingface_hub>=0.24,<1.0   # нужен для кэша/офлайна (scan_cache_dir и т.п.)
+safetensors>=0.4.3           # безопасные веса .safetensors
+sentencepiece==0.2.1         # токенайзеры типа t5/llama/bge
+accelerate>=0.34.0
+sentence-transformers>=3.0.0,<4
 FlagEmbedding==1.2.11
 peft==0.13.2
-sentence-transformers>=3.0.0,<4
-transformers==4.44.2
-accelerate>=0.34.0
 
-
-chardet==5.2.0
+# --- CV / OCR / parsing ---
+numpy>=1.26
+opencv-python-headless==4.10.0.84
 PyMuPDF==1.24.10
 pytesseract==0.3.13
 pillow==10.4.0
 python-docx==1.1.2
-
-
-numpy>=1.26
-opencv-python-headless==4.10.0.84
 easyocr==1.7.1
 scikit-image>=0.22
 shapely>=2.0
 python-bidi>=0.4.2
 
-
+# --- LLM runner (local) ---
 ollama==0.3.3
-

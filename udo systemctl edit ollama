@@ -1,0 +1,63 @@
+[0;1;34m# ]8;;file://srv-ai/etc/systemd/system/ollama.service/etc/systemd/system/ollama.service]8;;[0m
+[0;1;36m[Unit][0m
+Description=Ollama Service
+After=network-online.target
+[0;1;38;5;245m[0m
+[0;1;36m[Service][0m
+ExecStart=/usr/local/bin/ollama serve
+User=ollama
+Group=ollama
+Restart=always
+RestartSec=3
+Environment="PATH=/home/toor/ClinicalRecommendations/med_ai/.venv/bin:/home/toor/.vscode-server/cli/servers/Stable-7d842fb85a0275a4a8e4d7e040d2625abbf7f084/server/bin/remote-cli:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/home/toor/.vscode-server/extensions/ms-python.debugpy-2025.14.1-linux-x64/bundled/scripts/noConfigScripts"
+[0;1;38;5;245m[0m
+[0;1;36m[Install][0m
+WantedBy=default.target
+
+[0;1;34m# ]8;;file://srv-ai/etc/systemd/system/ollama.service.d/gpu.conf/etc/systemd/system/ollama.service.d/gpu.conf]8;;[0m
+[0;1;36m[Service][0m
+[0;1;38;5;245m# слушаем на 11434 (боевой порт для твоего приложения)[0m
+Environment=OLLAMA_HOST=0.0.0.0:11434
+[0;1;38;5;245m[0m
+[0;1;38;5;245m# форсим cuBLAS и разрешаем CUDA[0m
+Environment=OLLAMA_LLM_LIBRARY=cublas
+Environment=OLLAMA_NO_CUDA=0
+[0;1;38;5;245m[0m
+[0;1;38;5;245m# чтобы динамически точно нашлись CUDA-либы[0m
+Environment=LD_LIBRARY_PATH=/usr/local/cuda/targets/x86_64-linux/lib:/usr/lib/x86_64-linux-gnu
+[0;1;38;5;245m[0m
+[0;1;38;5;245m# (не обязательно) ограничим на 1 GPU[0m
+Environment=CUDA_VISIBLE_DEVICES=0
+
+[0;1;34m# ]8;;file://srv-ai/etc/systemd/system/ollama.service.d/override.conf/etc/systemd/system/ollama.service.d/override.conf]8;;[0m
+[0;1;36m[Service][0m
+[0;1;38;5;245m# Доступ к устройствам NVIDIA[0m
+PrivateDevices=no
+DevicePolicy=auto
+DeviceAllow=/dev/nvidiactl rw
+DeviceAllow=/dev/nvidia-uvm rw
+DeviceAllow=/dev/nvidia-uvm-tools rw
+DeviceAllow=/dev/nvidia-modeset rw
+DeviceAllow=/dev/nvidia0 rw
+[0;1;38;5;245m# DeviceAllow=/dev/nvidia1 rw  # если появится вторая карта[0m
+[0;1;38;5;245m[0m
+[0;1;38;5;245m# Иногда требуется доступ к caps-нодам для NVML[0m
+DeviceAllow=/dev/nvidia-caps/nvidia-cap1 r
+DeviceAllow=/dev/nvidia-caps/nvidia-cap2 r
+[0;1;38;5;245m[0m
+[0;1;38;5;245m# Добавляем группы с доступом к /dev/nvidia*[0m
+SupplementaryGroups=video render
+[0;1;38;5;245m[0m
+[0;1;38;5;245m# Разрешаем «неизвестные» новые GPU в ggml (5090 и т.п.)[0m
+Environment=GGML_CUDA_ENABLE_UNSUPPORTED_DEVICES=1
+[0;1;38;5;245m[0m
+[0;1;38;5;245m# Форсим CUDA/cuBLAS[0m
+Environment=OLLAMA_LLM_LIBRARY=cublas
+Environment=OLLAMA_NO_CUDA=0
+Environment=CUDA_VISIBLE_DEVICES=0
+[0;1;38;5;245m[0m
+[0;1;38;5;245m# Полезные env[0m
+Environment=OLLAMA_KEEP_ALIVE=30m
+Environment=OLLAMA_CONTEXT_LENGTH=16384
+Environment=LD_LIBRARY_PATH=/usr/local/cuda/targets/x86_64-linux/lib:/usr/lib/x86_64-linux-gnu
+Environment=PATH=/usr/local/cuda/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin

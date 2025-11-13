@@ -1,20 +1,19 @@
 # -*- coding: utf-8 -*-
 """
-Утилиты BM25/Hybrid Retrieval для Med_ai.
+BM25 / Hybrid Retrieval утилиты для Med_ai.
 
-ДОСТУПНЫЕ ФУНКЦИИ:
+Публичные функции:
   - bm25_search(index_dir: str, query: str, topk: int) -> List[dict]
   - embed_query_hf(query: str, model_name: str, device_hint: Optional[str], use_fp16: bool) -> List[float]
   - retrieve_hybrid(query: str, k: int, ..., per_doc_limit: int,
                     reranker_enabled: bool=False, rerank_top_k: int=50) -> List[dict]
 
-Особенности:
-- BM25 на Pyserini (Lucene). Если рядом с индексом есть meta-json (index/bm25_json/*.json),
-  берём оттуда doc_id/page/text. Иначе пытаемся распарсить raw/contents из Lucene или docid.
-- Qdrant: лёгкий клиент + query_points().
-- RRF-фьюжн списков (dense+bm25).
-- Опциональный переранкер: косинусная близость между эмбеддингом запроса и текста кандидата
-  через тот же HF-эмбеддер (без дополнительных зависимостей).
+Ключевые правки:
+- Эмбеддинг запроса теперь через тот же BGEM3FlagModel (FlagEmbedding), что и при индексации.
+- Qdrant возвращает кандидатов на уровне ЧАНКОВ (chunk_id + chunk_text из payload).
+- RRF фьюжн выполняется по chunk_id, а не по doc_id.
+- per_doc_limit применяется ПОСЛЕ фьюжна; берём действительно лучшие чанки.
+- Сохранены бэкапы при отсутствии chunk_text (подтягиваем текст страниц из data/*.pages.jsonl).
 """
 
 from __future__ import annotations
@@ -22,9 +21,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import math
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
 
 # ---------- Pyserini (Lucene) ----------
 try:
@@ -38,14 +40,13 @@ try:
 except Exception:
     QdrantClient = None  # обработаем ниже
 
-# ---------- HF embedding (Transformers) ----------
-import torch
-from transformers import AutoTokenizer, AutoModel
-
+# ---------- FlagEmbedding (BGEM3) ----------
+try:
+    from FlagEmbedding import BGEM3FlagModel
+except Exception as e:
+    BGEM3FlagModel = None  # дадим понятную ошибку при вызове
 
 # -------------------- Константы --------------------
-# Читаем лимиты из ENV (синхрон с runtime_settings.py),
-# с безопасными дефолтами.
 _TEXT_SNIPPET_LIMIT = int(
     os.getenv("CTX_SNIPPET_LIMIT")
     or os.getenv("TEXT_SNIPPET_LIMIT")
@@ -54,9 +55,7 @@ _TEXT_SNIPPET_LIMIT = int(
 
 _PER_DOC_LIMIT_DEFAULT = int(os.getenv("RETR_PER_DOC_LIMIT", "2"))
 
-
 # -------------------- Утилиты --------------------
-
 
 
 def _normalize_qdrant_url(url_in: Optional[str]) -> str:
@@ -65,23 +64,19 @@ def _normalize_qdrant_url(url_in: Optional[str]) -> str:
       - если пусто -> берем из env: QDRANT_URL или QDRANT
       - если без схемы (нет '://') -> подставляем http://
       - если что-то вроде 'qdrant:6333' или 'qdrant://qdrant:6333' -> переводим в http://qdrant:6333
-    Разрешенные схемы для клиента: http, https, grpc, grpcs.
+    Разрешенные схемы: http, https, grpc, grpcs.
     """
     url = (url_in or os.getenv("QDRANT_URL") or os.getenv("QDRANT") or "http://qdrant:6333").strip()
 
-    # 'qdrant:6333' -> добавим http://
     if "://" not in url:
         return f"http://{url}"
 
-    # 'qdrant://...' -> заменим на http://...
     if url.lower().startswith("qdrant://"):
         return "http://" + url[len("qdrant://"):]
 
-    # 'qdrant:...' (маловероятно с ://, но на всякий) -> http
     if url.lower().startswith("qdrant:"):
         return "http://" + url[len("qdrant:"):]
 
-    # всё ок
     return url
 
 
@@ -109,6 +104,7 @@ def _load_bm25_meta(index_dir: str) -> Dict[str, Dict[str, Any]]:
     meta_dir = base.with_name("bm25_json")
     mapping: Dict[str, Dict[str, Any]] = {}
     if not meta_dir.exists():
+        print(f"⚠️ bm25_json not found near {index_dir} — will rely on docid parsing/raw")
         return mapping
 
     for p in meta_dir.glob("*.json"):
@@ -144,8 +140,10 @@ def _load_bm25_meta(index_dir: str) -> Dict[str, Dict[str, Any]]:
     return mapping
 
 
-
 def _hit_to_record(searcher, hit, meta_map: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Возвращает BM25-кандидата уровня чанка.
+    """
     id_str = getattr(hit, "docid", None)
     if id_str and id_str in meta_map:
         m = meta_map[id_str]
@@ -153,15 +151,16 @@ def _hit_to_record(searcher, hit, meta_map: Dict[str, Dict[str, Any]]) -> Dict[s
             "doc_id": m["doc_id"],
             "page": int(m["page"] or 1),
             "text": (m["text"] or "")[:_TEXT_SNIPPET_LIMIT],
+            "chunk_id": str(id_str),
         }
 
-    rec: Dict[str, Any] = {"doc_id": "unknown", "page": 1, "text": ""}
+    rec: Dict[str, Any] = {"doc_id": "unknown", "page": 1, "text": "", "chunk_id": str(id_str) if id_str else "unknown"}
 
     try:
         doc = searcher.doc(hit.docid)
         raw = doc.raw() if callable(getattr(doc, "raw", None)) else None
         if raw:
-            j = json.loads(raw)  # это тот самый объект {"id","contents","raw": "...meta..."}
+            j = json.loads(raw)  # объект {"id","contents","raw": "...meta..."}
             text = j.get("contents") or ""
             doc_id = j.get("id") or "unknown"
             page = 1
@@ -187,6 +186,7 @@ def _hit_to_record(searcher, hit, meta_map: Dict[str, Dict[str, Any]]) -> Dict[s
                 "doc_id": str(doc_id),
                 "page": int(page),
                 "text": str(text)[:_TEXT_SNIPPET_LIMIT],
+                "chunk_id": str(id_str) if id_str else str(doc_id),
             }
 
         # fallback: хотя бы contents
@@ -211,32 +211,54 @@ def _hit_to_record(searcher, hit, meta_map: Dict[str, Dict[str, Any]]) -> Dict[s
     return rec
 
 
-
-# -------------------- Embeddings (HF Transformers) --------------------
-
-@lru_cache(maxsize=2)
-def _load_hf(model_name: str) -> Tuple[AutoTokenizer, AutoModel]:
-    tok = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-    mdl = AutoModel.from_pretrained(model_name, trust_remote_code=True)
-    mdl.eval()
-    return tok, mdl
+# -------------------- Embeddings (FlagEmbedding BGEM3) --------------------
 
 
-def _mean_pool(last_hidden_state: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-    mask = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
-    summed = torch.sum(last_hidden_state * mask, dim=1)
-    counts = torch.clamp(mask.sum(dim=1), min=1e-9)
-    return summed / counts
+@lru_cache(maxsize=3)
+def _get_flag_model(model_name: str, device_hint: Optional[str], use_fp16: bool):
+    if BGEM3FlagModel is None:
+        raise RuntimeError("FlagEmbedding (BGEM3FlagModel) не установлен. Установите пакет FlagEmbedding.")
+    dev = (device_hint or "auto").strip().lower()
+    if dev == "cpu":
+        device = "cpu"
+        fp16 = False
+    elif dev.startswith("cuda") or dev == "gpu" or dev == "auto":
+        # пусть BGEM3 сам разберётся; fp16 включаем только если cuda
+        device = "cuda" if dev != "cpu" else "cpu"
+        fp16 = bool(use_fp16 and device == "cuda")
+    else:
+        device = "cuda" if dev != "cpu" else "cpu"
+        fp16 = bool(use_fp16 and device == "cuda")
+    return BGEM3FlagModel(model_name, use_fp16=fp16, device=device)
 
 
-def _select_device(device_hint: Optional[str]) -> str:
-    if device_hint:
-        dh = device_hint.strip().lower()
-        if dh in {"cuda", "gpu"} and torch.cuda.is_available():
-            return "cuda"
-        if dh in {"cpu"}:
-            return "cpu"
-    return "cuda" if torch.cuda.is_available() else "cpu"
+def _encode_texts_flag(texts: List[str], model_name: str, device_hint: Optional[str], use_fp16: bool,
+                       batch_size: int = 128) -> np.ndarray:
+    m = _get_flag_model(model_name, device_hint, use_fp16)
+    try:
+        out = m.encode(
+            texts,
+            batch_size=max(1, batch_size),
+            return_dense=True,
+            return_sparse=False,
+            return_colbert_vecs=False,
+            normalize_embeddings=True,
+        )
+    except TypeError:
+        out = m.encode(texts, batch_size=max(1, batch_size))
+    vecs = None
+    if isinstance(out, dict) and out.get("dense_vecs") is not None:
+        vecs = out["dense_vecs"]
+    elif isinstance(out, (list, tuple)):
+        vecs = out
+    if vecs is None:
+        raise RuntimeError("BGEM3 encode() вернул неожиданный формат.")
+    arr = np.asarray(vecs, dtype=np.float32)
+    if arr.ndim == 1:
+        arr = arr.reshape(1, -1)
+    # уже L2-нормировано (normalize_embeddings=True), но на всякий:
+    norms = np.linalg.norm(arr, axis=1, keepdims=True) + 1e-9
+    return (arr / norms).astype(np.float32)
 
 
 def embed_query_hf(
@@ -245,71 +267,16 @@ def embed_query_hf(
     device_hint: Optional[str] = None,
     use_fp16: bool = False,
 ) -> List[float]:
+    """
+    Совместимая сигнатура, но теперь — BGEM3FlagModel (как при индексации).
+    """
     if not query:
         return []
-
-    tok, mdl = _load_hf(model_name)
-    device = _select_device(device_hint)
-    mdl = mdl.to(device)
-    if use_fp16 and device == "cuda":
-        mdl = mdl.half()
-
-    with torch.no_grad():
-        enc = tok(
-            query,
-            max_length=512,
-            padding=True,
-            truncation=True,
-            return_tensors="pt",
-        )
-        enc = {k: v.to(device) for k, v in enc.items()}
-        out = mdl(**enc)
-        if hasattr(out, "last_hidden_state"):
-            emb = _mean_pool(out.last_hidden_state, enc["attention_mask"])
-        elif isinstance(out, (list, tuple)):
-            emb = _mean_pool(out[0], enc["attention_mask"])
-        else:
-            raise RuntimeError("Не удалось получить last_hidden_state из модели.")
-        emb = torch.nn.functional.normalize(emb, p=2, dim=1).squeeze(0).float().cpu().tolist()
-        return emb
+    return _encode_texts_flag([query], model_name, device_hint, use_fp16, batch_size=16)[0].tolist()
 
 
-def _embed_texts(
-    texts: List[str],
-    model_name: str = "BAAI/bge-m3",
-    device_hint: Optional[str] = None,
-    use_fp16: bool = False,
-    batch_size: int = 16,
-) -> torch.Tensor:
-    tok, mdl = _load_hf(model_name)
-    device = _select_device(device_hint)
-    mdl = mdl.to(device)
-    if use_fp16 and device == "cuda":
-        mdl = mdl.half()
+# -------------------- Qdrant helpers --------------------
 
-    all_vecs: List[torch.Tensor] = []
-    mdl.eval()
-    with torch.no_grad():
-        for i in range(0, len(texts), batch_size):
-            chunk = texts[i:i + batch_size]
-            enc = tok(
-                chunk,
-                max_length=512,
-                padding=True,
-                truncation=True,
-                return_tensors="pt",
-            ).to(device)
-            out = mdl(**enc)
-            if hasattr(out, "last_hidden_state"):
-                vec = _mean_pool(out.last_hidden_state, enc["attention_mask"])
-            else:
-                vec = _mean_pool(out[0], enc["attention_mask"])
-            vec = torch.nn.functional.normalize(vec, p=2, dim=1)
-            all_vecs.append(vec.float().cpu())
-    return torch.cat(all_vecs, dim=0) if all_vecs else torch.empty(0)
-
-
-# -------------------- Qdrant --------------------
 
 @lru_cache(maxsize=2)
 def _qdrant_client(url: str):
@@ -317,6 +284,7 @@ def _qdrant_client(url: str):
         raise RuntimeError("qdrant-client не установлен.")
     prefer_grpc = (os.getenv("QDRANT__PREFER_GRPC", "false").lower() == "true")
     return QdrantClient(url=url, prefer_grpc=prefer_grpc)
+
 
 def _canon_doc_id(pl: Dict[str, Any], fallback: Optional[str] = None) -> str:
     for key in ("doc_id", "id", "source", "file", "document_id", "doc", "name"):
@@ -326,16 +294,14 @@ def _canon_doc_id(pl: Dict[str, Any], fallback: Optional[str] = None) -> str:
     return fallback or "unknown"
 
 
-
 def _rrf_fusion(runs: List[List[str]], k: int = 60, c: int = 60) -> Dict[str, float]:
     """
-    Reciprocal Rank Fusion.
-    На вход — списки doc_id (без повторов в своём списке), на выход — {doc_id: score}.
+    Reciprocal Rank Fusion по идентификаторам ЧАНКОВ.
     """
     scores: Dict[str, float] = {}
     for run in runs:
-        for rank, did in enumerate(run[:k], start=1):
-            scores[did] = scores.get(did, 0.0) + 1.0 / (c + rank)
+        for rank, cid in enumerate(run[:k], start=1):
+            scores[cid] = scores.get(cid, 0.0) + 1.0 / (c + rank)
     return scores
 
 
@@ -364,10 +330,11 @@ def _load_pages_text(pages_dir: Path, doc_id: str, a: int, b: int) -> str:
 
 # -------------------- Публичные функции --------------------
 
+
 def bm25_search(index_dir: str, query: str, topk: int = 50) -> List[Dict[str, Any]]:
     """
-    Поиск по Lucene (Pyserini). Возвращает список словарей:
-    { "doc_id": str, "page": int, "text": str }
+    Поиск по Lucene (Pyserini). Возвращает список словарей уровня чанка:
+    { "doc_id": str, "page": int, "text": str, "chunk_id": str }
     """
     if not query:
         return []
@@ -387,6 +354,11 @@ def bm25_search(index_dir: str, query: str, topk: int = 50) -> List[Dict[str, An
     out: List[Dict[str, Any]] = []
     for h in hits:
         rec = _hit_to_record(s, h, meta)
+        # добавим приблизительный score, если есть
+        try:
+            rec["_bm25_score"] = float(getattr(h, "score", 0.0))
+        except Exception:
+            pass
         out.append(rec)
     return out
 
@@ -407,114 +379,139 @@ def retrieve_hybrid(
     rerank_top_k: int = 50,
 ) -> List[Dict[str, Any]]:
     """
-    Гибридный поиск: Qdrant (dense) + BM25 (sparse) + RRF, возвращает до k фрагментов.
-    Если включён переранкер — досортируем кандидатов косинусом к запросу.
+    Гибридный поиск: Qdrant (dense, на уровне чанков) + BM25 (sparse, чанки) + RRF.
+    Возвращает до k фрагментов вида:
+      { "doc_id": str, "page_start": int, "page_end": int, "text": str }
     """
     results: List[Dict[str, Any]] = []
     if k <= 0 or not query:
         return results
 
-    # Нормализуем URL (это уберёт 'Unknown scheme: qdrant' при 'qdrant:6333' и пр.)
     qdrant_url = _normalize_qdrant_url(qdrant_url)
+    pages_dir_p = Path(pages_dir)
 
-    # ---------- 1) Qdrant (dense) ----------
-    qd_docids: List[str] = []
-    qd_payload_first: Dict[str, Dict[str, Any]] = {}
+    # ---------- 1) Qdrant (dense) -> чанки ----------
+    dense_runs_chunk_ids: List[str] = []
+    dense_by_chunk: Dict[str, Dict[str, Any]] = {}
     try:
-        vec = embed_query_hf(query, model_name=hf_model, device_hint=hf_device, use_fp16=hf_fp16)
+        q_vec = embed_query_hf(query, model_name=hf_model, device_hint=hf_device, use_fp16=hf_fp16)
         client = _qdrant_client(qdrant_url)
         pts = client.query_points(
             collection_name=qdrant_collection,
-            query=vec,
-            limit=max(k * 4, 40)
+            query=q_vec,
+            limit=max(k * 8, 80)  # побольше кандидатов, потом урежем
         ).points
+
         for p in pts:
             pl = p.payload or {}
-            did = _canon_doc_id(pl, fallback="unknown")
-            if did not in qd_payload_first:
-                qd_payload_first[did] = pl
-                qd_docids.append(did)
+            doc_id = _canon_doc_id(pl, fallback="unknown")
+            a = int(pl.get("page_start", 1) or 1)
+            b = int(pl.get("page_end", a) or a)
+            chunk_id = str(pl.get("chunk_id") or pl.get("text_hash") or f"{doc_id}:{a}-{b}")
+            text = (pl.get("chunk_text") or "").strip()
+
+            # fallback если нет chunk_text (старый индекс)
+            if not text:
+                text = _load_pages_text(pages_dir_p, doc_id, a, b)
+
+            text = (text or "")[:_TEXT_SNIPPET_LIMIT]
+            item = {
+                "doc_id": doc_id,
+                "page_start": a,
+                "page_end": b,
+                "text": text,
+                "_score_dense": float(getattr(p, "score", 0.0)),
+                "chunk_id": chunk_id,
+            }
+            if chunk_id not in dense_by_chunk:
+                dense_by_chunk[chunk_id] = item
+                dense_runs_chunk_ids.append(chunk_id)
     except Exception as e:
         print("⚠️ Qdrant retrieve error:", e)
 
-    # ---------- 2) BM25 (sparse) ----------
-    bm_docids: List[str] = []
-    bm_first: Dict[str, Dict[str, Any]] = {}
+    # ---------- 2) BM25 (sparse) -> чанки ----------
+    bm25_runs_chunk_ids: List[str] = []
+    bm25_by_chunk: Dict[str, Dict[str, Any]] = {}
     try:
-        hits = bm25_search(bm25_index_dir, query, topk=max(k * 4, 40))
+        hits = bm25_search(bm25_index_dir, query, topk=max(k * 8, 80))
         for h in hits:
-            did = str(h.get("doc_id") or "unknown")
-            if did not in bm_first:
-                bm_first[did] = h
-                bm_docids.append(did)
+            doc_id = str(h.get("doc_id") or "unknown")
+            page = int(h.get("page") or 1)
+            text = (h.get("text") or "")[:_TEXT_SNIPPET_LIMIT]
+            chunk_id = str(h.get("chunk_id") or f"{doc_id}_p{page}")
+            rec = {
+                "doc_id": doc_id,
+                "page_start": page,
+                "page_end": page,
+                "text": text,
+                "_bm25_score": float(h.get("_bm25_score", 0.0)),
+                "chunk_id": chunk_id,
+            }
+            if chunk_id not in bm25_by_chunk:
+                bm25_by_chunk[chunk_id] = rec
+                bm25_runs_chunk_ids.append(chunk_id)
     except Exception as e:
         print("⚠️ BM25 retrieve error:", e)
 
-    # ---------- 3) RRF ----------
-    fused = _rrf_fusion([qd_docids, bm_docids])
-    top_docids = [did for did, _ in sorted(fused.items(), key=lambda x: x[1], reverse=True)]
+    # ---------- 3) RRF по chunk_id ----------
+    fused_scores = _rrf_fusion([dense_runs_chunk_ids, bm25_runs_chunk_ids], k=60, c=60)
+    # объединим мета: dense приоритетнее, затем bm25
+    pool: Dict[str, Dict[str, Any]] = {}
+    for cid in set(list(dense_by_chunk.keys()) + list(bm25_by_chunk.keys())):
+        base = dense_by_chunk.get(cid) or bm25_by_chunk.get(cid)
+        if base:
+            pool[cid] = dict(base)
 
-    # ---------- 4) Сбор контента ----------
-    pages_dir_p = Path(pages_dir)
+    # сортируем чанки по fused score
+    sorted_chunk_ids = sorted(fused_scores.keys(), key=lambda x: fused_scores[x], reverse=True)
+
+    # ---------- 4) Применяем per_doc_limit и собираем кандидатов ----------
     used_per_doc: Dict[str, int] = {}
     candidates: List[Dict[str, Any]] = []
+    for cid in sorted_chunk_ids:
+        info = pool.get(cid)
+        if not info:
+            continue
+        did = info.get("doc_id", "unknown")
+        if used_per_doc.get(did, 0) >= max(1, per_doc_limit):
+            continue
+        # если вдруг текст пустой — подгрузим страницы
+        if not info.get("text"):
+            a, b = int(info.get("page_start", 1)), int(info.get("page_end", 1))
+            info["text"] = _load_pages_text(pages_dir_p, did, a, b)[:_TEXT_SNIPPET_LIMIT]
+        if not info.get("text"):
+            continue
+        candidates.append({
+            "doc_id": did,
+            "page_start": int(info.get("page_start", 1)),
+            "page_end": int(info.get("page_end", info.get("page_start", 1))),
+            "text": str(info.get("text") or "")[:_TEXT_SNIPPET_LIMIT],
+        })
+        used_per_doc[did] = used_per_doc.get(did, 0) + 1
+        if len(candidates) >= k:
+            break
 
-    for did in top_docids:
-        # BM25-чанк (узкий, обычно конкретная страница)
-        if did in bm_first and used_per_doc.get(did, 0) < per_doc_limit:
-            h = bm_first[did]
-            candidates.append({
-                "doc_id": did,
-                "page_start": int(h.get("page") or 1),
-                "page_end": int(h.get("page") or 1),
-                "text": (h.get("text") or "")[:_TEXT_SNIPPET_LIMIT],
-            })
-            used_per_doc[did] = used_per_doc.get(did, 0) + 1
-
-        # Qdrant «окно страниц»
-        if did in qd_payload_first and used_per_doc.get(did, 0) < per_doc_limit:
-            pl = qd_payload_first[did]
-            a = int(pl.get("page_start", 1) or 1)
-            b = int(pl.get("page_end", a) or a)
-            text = _load_pages_text(pages_dir_p, did, a, b) or _load_pages_text(pages_dir_p, did, 1, 1)
-            if text:
-                candidates.append({
-                    "doc_id": did,
-                    "page_start": a,
-                    "page_end": b,
-                    "text": text[:_TEXT_SNIPPET_LIMIT],
-                })
-                used_per_doc[did] = used_per_doc.get(did, 0) + 1
-
-    # ---------- 5) Опциональный переранкер ----------
+    # ---------- 5) Опциональный переранкер (cosine по BGEM3) ----------
     if reranker_enabled and candidates:
         try:
             n = min(rerank_top_k, len(candidates))
             if n > 0:
-                q_vec = torch.tensor(
-                    embed_query_hf(query, model_name=hf_model, device_hint=hf_device, use_fp16=hf_fp16)
-                ).unsqueeze(0)
-                t_vecs = _embed_texts([c["text"] for c in candidates[:n]],
-                                      model_name=hf_model, device_hint=hf_device, use_fp16=hf_fp16)
-                if t_vecs.numel() > 0:
-                    qn = torch.nn.functional.normalize(q_vec, p=2, dim=1)
-                    tn = torch.nn.functional.normalize(t_vecs, p=2, dim=1)
-                    sims = torch.matmul(qn, tn.T).squeeze(0).tolist()
-
-                    # присвоим score только head-части
-                    for i, s in enumerate(sims):
-                        candidates[i]["_rerank_score"] = float(s)
-
-                    # отсортируем head и приклеим хвост без изменений
-                    head = sorted(candidates[:n], key=lambda x: x.get("_rerank_score", 0.0), reverse=True)
-                    tail = candidates[n:]
-                    candidates = head + tail
+                q = np.asarray(embed_query_hf(query, model_name=hf_model, device_hint=hf_device, use_fp16=hf_fp16),
+                               dtype=np.float32).reshape(1, -1)
+                texts = [c["text"] for c in candidates[:n]]
+                t = _encode_texts_flag(texts, model_name=hf_model, device_hint=hf_device, use_fp16=hf_fp16,
+                                       batch_size=64)
+                # cosine(q, T)
+                sims = (q @ t.T).ravel().tolist()
+                for i, s in enumerate(sims):
+                    candidates[i]["_rerank_score"] = float(s)
+                head = sorted(candidates[:n], key=lambda x: x.get("_rerank_score", 0.0), reverse=True)
+                tail = candidates[n:]
+                candidates = head + tail
         except Exception as e:
-            print("⚠️ Reranker (cosine) error:", e)
+            print("⚠️ Reranker (cosine/BGEM3) error:", e)
+        finally:
+            for it in candidates:
+                it.pop("_rerank_score", None)
 
-    # ---------- 6) Вернуть top-k ----------
-    out: List[Dict[str, Any]] = []
-    for it in candidates[:k]:
-        it.pop("_rerank_score", None)
-        out.append(it)
-    return out
+    return candidates[:k]
